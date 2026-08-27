@@ -1,0 +1,741 @@
+const state = {
+  config: null,
+  queue: [],
+  completedIds: new Set(),
+  sessionOwner: null,
+  selectedContacts: new Map(),
+  navigationHistory: [],
+  templates: [],
+  templateTarget: "copy",
+  sendpilotRoute: null,
+  syncing: false,
+  syncTimer: null,
+  noteRequest: 0,
+};
+
+const $ = (selector) => document.querySelector(selector);
+const card = $("#lead-card");
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  });
+  if (response.status === 204) return null;
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  return data;
+}
+
+function toast(message) {
+  const element = $("#toast");
+  element.textContent = message;
+  element.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => element.classList.remove("show"), 2600);
+}
+
+function current() {
+  return state.queue[0] || null;
+}
+
+function selectedContact(company = current()) {
+  if (!company?.contacts?.length) return null;
+  const selectedId = state.selectedContacts.get(company.entryId);
+  return company.contacts.find((contact) => contact.id === selectedId) || company.contacts[0];
+}
+
+function sourceBadge(contact, company) {
+  const route = contact?.sendpilot;
+  if (!route) {
+    return '<span class="source-badge uncertain">SENDPILOT · CHECK ON OPEN</span>';
+  }
+  if (route.routes?.length) {
+    return `<span class="source-badge uncertain">SENDPILOT · ${route.routes.length} CONVERSATIONS</span>`;
+  }
+  if (route?.source === "unipile_fallback" && route.verified) {
+    return `<span class="source-badge sendpilot">UNIPILE FALLBACK - ${escapeHtml(route.senderName)}</span>`;
+  }
+  if (route?.source === "sendpilot_campaign" && route.verified) {
+    return `<span class="source-badge sendpilot">SENDPILOT · ${escapeHtml(route.senderName)}</span>`;
+  }
+  if (route?.source === "sendpilot_campaign") {
+    return '<span class="source-badge uncertain">SENDPILOT · MANUAL</span>';
+  }
+  return '<span class="source-badge manual">MANUAL</span>';
+}
+
+function attioSourceBadge(contact, company) {
+  const source = contact?.source || company?.source;
+  return source ? `<span class="source-badge campaign-source">${escapeHtml(source)}</span>` : "";
+}
+
+function formatDate(value) {
+  if (!value) return "No date";
+  const date = new Date(value.length === 10 ? `${value}T12:00:00Z` : value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: "Asia/Tbilisi" }).format(date);
+}
+
+function todayTbilisi() {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tbilisi", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const get = (type) => parts.find((part) => part.type === type)?.value;
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+function setActions(enabled) {
+  for (const button of document.querySelectorAll(".action-rail button")) button.disabled = !enabled;
+  $("#previous-button").disabled = !enabled || state.navigationHistory.length === 0;
+  $("#next-button").disabled = !enabled || state.queue.length < 2;
+}
+
+function render() {
+  const company = current();
+  const completed = state.completedIds.size;
+  const total = completed + state.queue.length;
+  const progress = total ? (completed / total) * 100 : 100;
+  $("#progress-bar").style.width = `${progress}%`;
+
+  if (!company) {
+    $("#count").textContent = state.syncing ? "…" : "DONE";
+    setActions(false);
+    card.innerHTML = state.syncing
+      ? '<div class="loading-card"><div class="loading-dot"></div><h2>Building your queue</h2><span>Checking Attio and sorting the next conversations.</span></div>'
+      : '<div class="complete"><p>QUEUE COMPLETE</p><h2>That is it.</h2><span>Every eligible company has a next step.</span></div>';
+    return;
+  }
+
+  setActions(true);
+  const ordinal = Math.min(completed + 1, total);
+  $("#count").textContent = `${String(ordinal).padStart(2, "0")} / ${String(total).padStart(2, "0")}`;
+  const contact = selectedContact(company);
+  const domain = company.domains?.[0] || null;
+  const contactControl = company.contacts.length > 1
+    ? `<select class="contact-select" id="contact-select" aria-label="Select contact">${company.contacts.map((person) => `<option value="${escapeHtml(person.id)}" ${person.id === contact?.id ? "selected" : ""}>${escapeHtml(person.name)}</option>`).join("")}</select>`
+    : `<strong>${escapeHtml(contact?.name || "No associated contact")}</strong>`;
+  const linkedin = contact?.linkedinUrl
+    ? `<a href="${escapeHtml(contact.linkedinUrl)}" target="_blank" rel="noreferrer">LinkedIn →</a>`
+    : contact
+      ? '<button class="inline-link" id="add-linkedin">+ Add LinkedIn URL</button>'
+      : "";
+  const emails = company.contacts.flatMap((person) =>
+    (person.emails || []).map((email) => ({ email, name: person.name }))
+  );
+
+  card.innerHTML = `<div class="contact-card">
+    <div class="company-line">
+      <div><p class="queue-label">${escapeHtml(company.queueLabel)}</p><h2>${escapeHtml(company.companyName)}</h2></div>
+      ${domain ? `<a class="domain-link" href="https://${escapeHtml(domain)}" target="_blank" rel="noreferrer">${escapeHtml(domain)} ↗</a>` : '<span class="domain-link">No domain</span>'}
+    </div>
+    <div class="contact-line">
+      <span class="section-label">CONTACT</span>
+      <div class="contact-name-row">${contactControl}<div class="contact-links">${attioSourceBadge(contact, company)}${sourceBadge(contact, company)}${linkedin}</div></div>
+      <div id="linkedin-editor"></div>
+    </div>
+    <div class="email-section">
+      <span class="section-label">EMAILS</span>
+      <div class="email-list">${emails.length ? emails.map((item) => `<div class="email-row"><button class="inline-email" data-email="${escapeHtml(item.email)}" data-name="${escapeHtml(item.name)}">${escapeHtml(item.email)}</button><span>${escapeHtml(item.name)}</span></div>`).join("") : '<span class="empty-note">No associated email addresses</span>'}</div>
+    </div>
+    <section class="context">
+      <div class="context-heading"><span class="section-label">ATTIO NOTES</span><button id="fix-interaction">Fix interaction</button></div>
+      <div id="notes"><p class="empty-note">Loading notes…</p></div>
+    </section>
+    <div class="card-meta"><span>${escapeHtml(company.stage)} · ${company.followUpCount || 0} follow-ups</span><span>Last touch ${escapeHtml(formatDate(company.lastInteractionDate))}</span></div>
+  </div>`;
+
+  $("#linkedin-button").disabled = !contact;
+  $("#email-button").disabled = !contact?.emails?.length;
+  $("#contact-select")?.addEventListener("change", (event) => {
+    state.selectedContacts.set(company.entryId, event.target.value);
+    render();
+  });
+  $("#add-linkedin")?.addEventListener("click", showLinkedinEditor);
+  for (const button of document.querySelectorAll(".inline-email")) {
+    button.addEventListener("click", () => openEmail(button.dataset.email, button.dataset.name));
+  }
+  $("#fix-interaction")?.addEventListener("click", openRepair);
+  loadNotes(company);
+}
+
+async function loadNotes(company) {
+  const requestId = ++state.noteRequest;
+  try {
+    const { notes } = await api(`/api/companies/${encodeURIComponent(company.companyId)}/notes`);
+    if (requestId !== state.noteRequest || current()?.entryId !== company.entryId) return;
+    const container = $("#notes");
+    container.innerHTML = notes.length
+      ? notes.map((note) => `<article><div><strong>${escapeHtml(note.title)}</strong><time>${escapeHtml(formatDate(note.createdAt))}</time></div><p>${escapeHtml(note.body)}</p></article>`).join("")
+      : '<p class="empty-note">No company notes yet.</p>';
+  } catch (error) {
+    if (requestId === state.noteRequest && $("#notes")) $("#notes").innerHTML = `<p class="empty-note">Could not load notes. ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function showLinkedinEditor() {
+  const container = $("#linkedin-editor");
+  container.innerHTML = '<div class="linkedin-editor"><input id="linkedin-input" placeholder="linkedin.com/in/…" aria-label="LinkedIn profile URL"><button class="mini-button" id="save-linkedin">Save</button></div>';
+  $("#linkedin-input").focus();
+  $("#save-linkedin").onclick = saveLinkedin;
+}
+
+async function saveLinkedin() {
+  const company = current();
+  const contact = selectedContact(company);
+  if (!contact) return;
+  const button = $("#save-linkedin");
+  button.disabled = true;
+  try {
+    const result = await api(`/api/people/${encodeURIComponent(contact.id)}/linkedin`, {
+      method: "PATCH",
+      body: JSON.stringify({ url: $("#linkedin-input").value }),
+    });
+    contact.linkedinUrl = result.url;
+    contact.sendpilot = null;
+    toast("LinkedIn URL saved to Attio");
+    render();
+  } catch (error) {
+    toast(error.message);
+    button.disabled = false;
+  }
+}
+
+async function syncQueue({ quiet = false } = {}) {
+  if (state.syncing) return;
+  state.syncing = true;
+  if (!quiet) render();
+  $("#sync-status").textContent = "Syncing with Attio…";
+  try {
+    const ownerId = $("#rep-select").value;
+    if (state.sessionOwner !== ownerId) {
+      state.sessionOwner = ownerId;
+      state.completedIds.clear();
+      state.navigationHistory.length = 0;
+    }
+    const oldIds = new Set(state.queue.map((company) => company.entryId));
+    const currentId = current()?.entryId;
+    const result = await api("/api/sync", { method: "POST", body: JSON.stringify({ ownerId }) });
+    const freshIds = new Set(result.queue.map((company) => company.entryId));
+    for (const oldId of oldIds) {
+      if (!freshIds.has(oldId)) state.completedIds.add(oldId);
+    }
+    const fresh = result.queue.filter((company) => !state.completedIds.has(company.entryId));
+
+    // Sync should bring in Attio changes without losing the card the rep is
+    // currently reviewing or the path used by backward navigation.
+    state.navigationHistory = state.navigationHistory.filter((entryId) => freshIds.has(entryId));
+    const nextQueue = [...fresh];
+    if (currentId) {
+      const currentIndex = nextQueue.findIndex((company) => company.entryId === currentId);
+      if (currentIndex > 0) nextQueue.unshift(...nextQueue.splice(currentIndex, 1));
+    }
+    state.queue = nextQueue;
+    $("#sync-status").textContent = `Synced ${new Date(result.syncedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  } catch (error) {
+    $("#sync-status").textContent = "Sync failed";
+    toast(error.message);
+  } finally {
+    state.syncing = false;
+    render();
+  }
+}
+
+function completeCurrent(message) {
+  const company = state.queue.shift();
+  if (company) {
+    state.completedIds.add(company.entryId);
+    state.navigationHistory = state.navigationHistory.filter((entryId) => entryId !== company.entryId);
+  }
+  toast(message);
+  render();
+}
+
+function navigateForward() {
+  if (state.queue.length < 2) return;
+  const company = state.queue.shift();
+  state.queue.push(company);
+  state.navigationHistory.push(company.entryId);
+  render();
+}
+
+function navigateBackward() {
+  while (state.navigationHistory.length) {
+    const entryId = state.navigationHistory.pop();
+    const index = state.queue.findIndex((company) => company.entryId === entryId);
+    if (index < 0) continue;
+    state.queue.unshift(...state.queue.splice(index, 1));
+    render();
+    return;
+  }
+  render();
+}
+
+async function openComposer() {
+  const company = current();
+  const contact = selectedContact(company);
+  if (!company || !contact) return;
+  let route = contact.sendpilot || { source: "manual", reason: "No SendPilot conversation found" };
+  state.sendpilotRoute = route;
+  $("#composer-title").textContent = `${contact.name} · ${company.companyName}`;
+  $("#message-text").value = "";
+  $("#composer-dialog").showModal();
+  if (!contact.sendpilot) {
+    $("#composer-source").textContent = "CHECKING SENDPILOT";
+    $("#sender-options").innerHTML = '<p class="sender-option-status">Loading existing conversation…</p>';
+    $("#send-linkedin").disabled = true;
+    $("#thread").innerHTML = '<p class="empty-note">Loading SendPilot conversation…</p>';
+    try {
+      route = await api("/api/sendpilot/resolve", {
+        method: "POST",
+        body: JSON.stringify({
+          entryId: company.entryId,
+          personId: contact.id,
+          name: contact.name,
+          linkedinUrl: contact.linkedinUrl,
+          linkedinUrn: contact.linkedinUrn,
+        }),
+      });
+    } catch (error) {
+      route = { source: "manual", verified: false, reason: error.message };
+    }
+  }
+  contact.sendpilot = route;
+  state.sendpilotRoute = route;
+  if (route.routes?.length) {
+    $("#composer-source").textContent = "SENDPILOT · CHOOSE CONVERSATION";
+    $("#sender-options").innerHTML = route.routes.map((item) =>
+      `<button type="button" class="sender-option" data-sender-id="${escapeHtml(item.senderId)}" aria-pressed="false"><strong>${escapeHtml(item.senderName)}</strong><span>${escapeHtml(item.verified ? item.campaignName : item.reason)}</span></button>`
+    ).join("");
+    for (const button of $("#sender-options").querySelectorAll(".sender-option")) {
+      button.onclick = () => selectSenderConversation(button.dataset.senderId);
+    }
+    $("#send-linkedin").textContent = "Choose a conversation first";
+    $("#send-linkedin").disabled = true;
+    renderThread();
+    return;
+  }
+  const sendpilot = route.source === "sendpilot_campaign" && route.verified;
+  const unipile = route.source === "unipile_fallback" && route.verified;
+  $("#composer-source").textContent = sendpilot ? `SENDPILOT CAMPAIGN · ${route.campaignName}` : "MANUAL LINKEDIN";
+  $("#sender-options").innerHTML = sendpilot
+    ? `<div class="sender-option selected" data-sender-id="${escapeHtml(route.senderId)}"><strong>${escapeHtml(route.senderName)}</strong><span>Verified existing conversation</span></div>`
+    : `<div class="sender-option selected"><strong>Manual send</strong>${route.reason ? `<span>${escapeHtml(route.reason)}</span>` : ""}</div>`;
+  if (unipile) {
+    $("#composer-source").textContent = `UNIPILE FALLBACK - ${route.senderName}`;
+    $("#sender-options").innerHTML = `<div class="sender-option selected" data-sender-id="${escapeHtml(route.senderId)}"><strong>${escapeHtml(route.senderName)}</strong><span>Verified existing conversation</span></div>`;
+  }
+  $("#send-linkedin").textContent = sendpilot ? "Send via SendPilot" : "Copy & open LinkedIn";
+  if (unipile) $("#send-linkedin").textContent = "Send via Unipile";
+  $("#send-linkedin").disabled = false;
+  renderThread();
+}
+
+function renderThread() {
+  const route = state.sendpilotRoute;
+  const thread = $("#thread");
+  if (route?.routes?.length) {
+    thread.innerHTML = '<p class="empty-note">Choose the sender whose existing conversation you want to use.</p>' + route.routes.map((item) =>
+      `<p class="empty-note"><strong>${escapeHtml(item.senderName)}</strong> · ${item.messages.length} messages · last active ${escapeHtml(formatDate(item.lastActivityAt))}</p>`
+    ).join("");
+    return;
+  }
+  if (!route?.verified) {
+    const messages = route?.messages || [];
+    thread.innerHTML = `<p class="empty-note">Manual only${route?.reason ? ` · ${escapeHtml(route.reason)}` : ""}.</p>` + (messages.length
+      ? messages.map((message) => `<div class="message-bubble ${message.isSender ? "ours" : "theirs"}">${escapeHtml(message.text)}<time>${escapeHtml(formatDate(message.timestamp))}</time></div>`).join("")
+      : '<p class="empty-note">No SendPilot conversation could be verified for this contact.</p>');
+  } else {
+    thread.innerHTML = route.messages.length
+      ? route.messages.map((message) => `<div class="message-bubble ${message.isSender ? "ours" : "theirs"}">${escapeHtml(message.text)}<time>${escapeHtml(formatDate(message.timestamp))}</time></div>`).join("")
+      : '<p class="empty-note">Existing conversation found, with no message preview.</p>';
+    thread.scrollTop = thread.scrollHeight;
+  }
+}
+
+function selectSenderConversation(senderId) {
+  const aggregate = selectedContact()?.sendpilot;
+  const route = aggregate?.routes?.find((item) => item.senderId === senderId);
+  if (!route) {
+    state.sendpilotRoute = aggregate;
+    $("#composer-source").textContent = "SENDPILOT · CHOOSE CONVERSATION";
+    $("#send-linkedin").textContent = "Choose a conversation first";
+    $("#send-linkedin").disabled = true;
+    renderThread();
+    return;
+  }
+  for (const button of $("#sender-options").querySelectorAll(".sender-option")) {
+    const selected = button.dataset.senderId === senderId;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  state.sendpilotRoute = route;
+  const unipile = route.source === "unipile_fallback" && route.verified;
+  $("#composer-source").textContent = route.verified ? `SENDPILOT CAMPAIGN · ${route.campaignName}` : `SENDPILOT · ${route.senderName}`;
+  $("#send-linkedin").textContent = route.verified ? "Send via SendPilot" : "Copy & open LinkedIn";
+  $("#send-linkedin").disabled = false;
+  if (unipile) {
+    $("#composer-source").textContent = `UNIPILE FALLBACK - ${route.senderName}`;
+    $("#send-linkedin").textContent = "Send via Unipile";
+  }
+  renderThread();
+}
+
+async function sendLinkedin() {
+  const company = current();
+  const contact = selectedContact(company);
+  const route = state.sendpilotRoute;
+  const message = $("#message-text").value.trim();
+  if (!company || !contact || !message) return toast("Write a message first");
+  if (!route?.verified) {
+    try {
+      await navigator.clipboard.writeText(message);
+      if (contact.linkedinUrl) window.open(contact.linkedinUrl, "_blank", "noopener,noreferrer");
+      $("#composer-dialog").close();
+      toast("Message copied · send manually in LinkedIn");
+    } catch {
+      toast("Could not copy the message. Select and copy it manually.");
+    }
+    return;
+  }
+  const button = $("#send-linkedin");
+  const unipile = route.source === "unipile_fallback";
+  button.disabled = true;
+  button.textContent = "Sending…";
+  try {
+    await api(unipile ? "/api/unipile/send" : "/api/sendpilot/send", {
+      method: "POST",
+      body: JSON.stringify({
+        idempotencyKey: crypto.randomUUID(),
+        entryId: company.entryId,
+        personId: contact.id,
+        leadId: route.leadId,
+        senderId: route.senderId,
+        chatId: route.chatId,
+        contactName: contact.name,
+        linkedinUrl: contact.linkedinUrl,
+        message,
+      }),
+    });
+    $("#composer-dialog").close();
+    if (unipile) {
+      completeCurrent("Sent via Unipile - Attio sync pending");
+      return;
+    }
+    completeCurrent("Sent via SendPilot · Attio sync pending");
+  } catch (error) {
+    toast(`${error.message} No automatic resend was attempted.`);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Send via SendPilot";
+    if (unipile) button.textContent = "Send via Unipile";
+  }
+}
+
+function emailProvider() {
+  return state.config?.emailComposerProvider === "outlook" ? "outlook" : "gmail";
+}
+
+function showEmailComposer(email, name) {
+  const contact = selectedContact();
+  const provider = emailProvider();
+  $("#email-composer-source").textContent = `${provider.toUpperCase()} COMPOSER`;
+  $("#email-composer-title").textContent = `Email ${name || contact?.name || "contact"}`;
+  $("#email-to").value = email;
+  $("#email-subject").value = "";
+  $("#email-message").value = "";
+  $("#launch-email-composer").textContent = `Open in ${provider === "outlook" ? "Outlook" : "Gmail"}`;
+  $("#email-dialog").showModal();
+  $("#email-subject").focus();
+}
+
+async function openEmail(emailOverride = null, nameOverride = null) {
+  const contact = selectedContact();
+  const email = typeof emailOverride === "string" ? emailOverride : contact?.emails?.[0];
+  if (!email) return toast("This contact has no email address");
+  if (emailProvider() !== "gmail" || !state.config?.gmailThreadLookupEnabled) {
+    showEmailComposer(email, nameOverride);
+    return;
+  }
+
+  // Reserve a tab while the click is still a direct user gesture, otherwise the
+  // browser may block it after the asynchronous Gmail lookup finishes.
+  const tab = window.open("about:blank", "_blank");
+  if (tab) {
+    tab.opener = null;
+    tab.document.title = "Checking Gmail…";
+    tab.document.body.textContent = "Checking for an existing email thread…";
+  }
+  toast("Checking Gmail for an existing thread…");
+  try {
+    const result = await api("/api/email/resolve", {
+      method: "POST",
+      body: JSON.stringify({ ownerId: state.sessionOwner, email }),
+    });
+    if (result.found && result.url) {
+      if (tab) tab.location.replace(result.url);
+      else window.location.assign(result.url);
+      toast(`Existing thread opened in ${result.mailbox} · reply in Gmail`);
+      return;
+    }
+    tab?.close();
+    showEmailComposer(email, nameOverride);
+  } catch (error) {
+    tab?.close();
+    showEmailComposer(email, nameOverride);
+    toast(`${error.message} · you can still open a new draft`);
+  }
+}
+
+function launchEmailComposer() {
+  const provider = emailProvider();
+  const to = $("#email-to").value.trim();
+  const subject = $("#email-subject").value;
+  const body = $("#email-message").value;
+  if (!to) return toast("Choose an email address");
+
+  const url = provider === "outlook"
+    ? new URL("https://outlook.office.com/mail/deeplink/compose")
+    : new URL("https://mail.google.com/mail/");
+  if (provider === "gmail") {
+    url.searchParams.set("view", "cm");
+    url.searchParams.set("fs", "1");
+    url.searchParams.set("to", to);
+    if (subject) url.searchParams.set("su", subject);
+  } else {
+    url.searchParams.set("to", to);
+    if (subject) url.searchParams.set("subject", subject);
+  }
+  if (body) url.searchParams.set("body", body);
+
+  window.open(url.toString(), "_blank", "noopener,noreferrer");
+  $("#email-dialog").close();
+  toast(`Draft opened in ${provider === "outlook" ? "Outlook" : "Gmail"} · card stays in queue`);
+}
+
+async function loadTemplates() {
+  const result = await api("/api/templates");
+  state.templates = result.templates;
+  renderTemplates();
+}
+
+async function openTemplates(target = "copy") {
+  state.templateTarget = target;
+  $("#template-form").classList.add("hidden");
+  $("#templates-dialog").showModal();
+  try { await loadTemplates(); } catch (error) { toast(error.message); }
+}
+
+function renderTemplates() {
+  const list = $("#template-list");
+  list.innerHTML = state.templates.length
+    ? state.templates.map((template) => `<article class="template-item" data-id="${escapeHtml(template.id)}"><header><strong>${escapeHtml(template.name)}</strong></header><p>${escapeHtml(template.body)}</p><div class="template-item-actions">${["composer", "email"].includes(state.templateTarget) ? '<button class="use-template">Use</button>' : ""}<button class="copy-template">Copy</button><button class="edit-template">Edit</button><button class="delete-template">Delete</button></div></article>`).join("")
+    : '<p class="empty-note">No templates yet. Use + to add the first one.</p>';
+  for (const item of list.querySelectorAll(".template-item")) {
+    const template = state.templates.find((value) => value.id === item.dataset.id);
+    item.querySelector(".use-template")?.addEventListener("click", () => {
+      const target = state.templateTarget === "email" ? $("#email-message") : $("#message-text");
+      target.value = template.body;
+      $("#templates-dialog").close();
+      target.focus();
+    });
+    item.querySelector(".copy-template").onclick = () => copyText(template.body);
+    item.querySelector(".edit-template").onclick = () => showTemplateForm(template);
+    item.querySelector(".delete-template").onclick = () => deleteTemplate(template);
+  }
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Template copied");
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    document.body.append(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+    toast("Template copied");
+  }
+}
+
+function showTemplateForm(template = null) {
+  $("#template-id").value = template?.id || "";
+  $("#template-name").value = template?.name || "";
+  $("#template-body").value = template?.body || "";
+  $("#template-form").classList.remove("hidden");
+  $("#template-name").focus();
+}
+
+async function saveTemplate(event) {
+  event.preventDefault();
+  const id = $("#template-id").value;
+  const body = { name: $("#template-name").value, body: $("#template-body").value };
+  try {
+    await api(id ? `/api/templates/${encodeURIComponent(id)}` : "/api/templates", {
+      method: id ? "PATCH" : "POST",
+      body: JSON.stringify(body),
+    });
+    $("#template-form").classList.add("hidden");
+    await loadTemplates();
+    toast(id ? "Template updated" : "Template added");
+  } catch (error) { toast(error.message); }
+}
+
+async function deleteTemplate(template) {
+  if (!window.confirm(`Delete “${template.name}”?`)) return;
+  try {
+    await api(`/api/templates/${encodeURIComponent(template.id)}`, { method: "DELETE" });
+    await loadTemplates();
+    toast("Template deleted");
+  } catch (error) { toast(error.message); }
+}
+
+function openRepair() {
+  $("#repair-direction").value = "Us";
+  $("#repair-date").value = todayTbilisi();
+  $("#repair-dialog").showModal();
+}
+
+async function saveRepair() {
+  const company = current();
+  if (!company) return;
+  const button = $("#save-repair");
+  button.disabled = true;
+  try {
+    const result = await api("/api/interactions/repair", {
+      method: "POST",
+      body: JSON.stringify({ entryId: company.entryId, companyId: company.companyId, direction: $("#repair-direction").value, date: $("#repair-date").value }),
+    });
+    $("#repair-dialog").close();
+    toast(result.incremented ? "Attio repaired · follow-up counter incremented" : "Attio interaction repaired");
+    company.lastInteractionBy = $("#repair-direction").value;
+    company.lastInteractionDate = $("#repair-date").value;
+    if (result.stageChanged) company.stage = "Qualified";
+    if (Number.isFinite(result.followUpCount)) company.followUpCount = result.followUpCount;
+    render();
+  } catch (error) { toast(error.message); } finally { button.disabled = false; }
+}
+
+function askNotQualified() {
+  const company = current();
+  if (!company) return;
+  $("#confirm-copy").textContent = `${company.companyName} will leave this follow-up queue.`;
+  $("#confirm-dialog").showModal();
+}
+
+async function markNotQualified() {
+  const company = current();
+  if (!company) return;
+  const button = $("#confirm-not-qualified");
+  button.disabled = true;
+  try {
+    await api(`/api/entries/${encodeURIComponent(company.entryId)}/not-qualified`, { method: "POST", body: "{}" });
+    $("#confirm-dialog").close();
+    completeCurrent("Moved to Not qualified in Attio");
+  } catch (error) { toast(error.message); } finally { button.disabled = false; }
+}
+
+function askLost() {
+  const company = current();
+  if (!company) return;
+  $("#confirm-lost-copy").textContent = `${company.companyName} will move to Lost and leave this follow-up queue.`;
+  $("#confirm-lost-dialog").showModal();
+}
+
+async function markLost() {
+  const company = current();
+  if (!company) return;
+  const button = $("#confirm-lost");
+  button.disabled = true;
+  try {
+    await api(`/api/entries/${encodeURIComponent(company.entryId)}/lost`, { method: "POST", body: "{}" });
+    $("#confirm-lost-dialog").close();
+    completeCurrent("Moved to Lost in Attio");
+  } catch (error) { toast(error.message); } finally { button.disabled = false; }
+}
+
+async function init() {
+  render();
+  try {
+    state.config = await api("/api/config");
+    $("#rep-select").innerHTML = state.config.reps.map((rep) => `<option value="${escapeHtml(rep.id)}">${escapeHtml(rep.name)}</option>`).join("");
+    const savedRep = localStorage.getItem("followup-rep");
+    if (savedRep && state.config.reps.some((rep) => rep.id === savedRep)) $("#rep-select").value = savedRep;
+    if (state.config.mode === "mock") $("#sync-status").textContent = "Demo data · safe mode";
+    await syncQueue();
+    scheduleNextSync();
+  } catch (error) {
+    state.syncing = false;
+    $("#sync-status").textContent = "Could not start";
+    card.innerHTML = `<div class="complete"><p>CONNECTION ERROR</p><h2>Followup needs attention.</h2><span>${escapeHtml(error.message)}</span></div>`;
+    toast(error.message);
+  }
+}
+
+function scheduleNextSync() {
+  clearTimeout(state.syncTimer);
+  state.syncTimer = setTimeout(async () => {
+    await syncQueue({ quiet: true });
+    scheduleNextSync();
+  }, state.config.syncIntervalMs);
+}
+
+$("#rep-select").addEventListener("change", async () => {
+  localStorage.setItem("followup-rep", $("#rep-select").value);
+  state.queue = [];
+  state.completedIds.clear();
+  state.sessionOwner = null;
+  await syncQueue();
+  scheduleNextSync();
+});
+$("#sync-button").onclick = async () => {
+  await syncQueue();
+  scheduleNextSync();
+};
+$("#rules-button").onclick = () => $("#rules-dialog").showModal();
+$("#linkedin-button").onclick = openComposer;
+$("#email-button").onclick = () => openEmail();
+$("#email-templates").onclick = () => openTemplates("email");
+$("#launch-email-composer").onclick = launchEmailComposer;
+$("#templates-button").onclick = () => openTemplates("copy");
+$("#not-qualified-button").onclick = askNotQualified;
+$("#lost-button").onclick = askLost;
+$("#previous-button").onclick = navigateBackward;
+$("#next-button").onclick = navigateForward;
+$("#send-linkedin").onclick = sendLinkedin;
+$("#composer-templates").onclick = () => openTemplates("composer");
+$("#add-template-button").onclick = () => showTemplateForm();
+$("#cancel-template").onclick = () => $("#template-form").classList.add("hidden");
+$("#template-form").onsubmit = saveTemplate;
+$("#save-repair").onclick = saveRepair;
+$("#confirm-not-qualified").onclick = markNotQualified;
+$("#confirm-lost").onclick = markLost;
+for (const button of document.querySelectorAll("[data-close]")) {
+  button.addEventListener("click", () => $(`#${button.dataset.close}`).close());
+}
+document.addEventListener("keydown", (event) => {
+  if ($("dialog[open]") || event.metaKey || event.ctrlKey || event.altKey) return;
+  if (["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
+  if (event.key.toLowerCase() === "l") openComposer();
+  if (event.key.toLowerCase() === "e") openEmail();
+  if (event.key.toLowerCase() === "t") openTemplates("copy");
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    navigateBackward();
+  }
+  if (event.key === "ArrowRight") {
+    event.preventDefault();
+    navigateForward();
+  }
+});
+
+init();

@@ -1,0 +1,27 @@
+{
+  "name": "followup-tinder-mvp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "start:mock": "node --env-file-if-exists=.env server.js --mock",
+    "dev": "node --env-file-if-exists=.env --watch server.js",
+    "check": "node --check server.js && node --check app.js && node --check src/attio.js && node --check src/gmail.js && node --check src/identity.js && node --check src/linkedin-routing.js && node --check src/sendpilot.js && node --check src/unipile.js && node --check src/queue.js && node --check src/store.js",
+    "test": "node --test tests/*.test.js",
+    "test:e2e": "playwright test",
+    "test:all": "npm run check && npm test && npm run test:e2e",
+    "audit:live": "node --env-file-if-exists=.env scripts/live-audit.js",
+    "audit:sendpilot": "node --env-file-if-exists=.env scripts/audit-sendpilot-routing.js",
+    "audit:sendpilot-matching": "node --env-file-if-exists=.env scripts/audit-sendpilot-matching.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}

@@ -1,0 +1,15 @@
+.inline-email {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.inline-email:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}

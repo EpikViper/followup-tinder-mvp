@@ -1,0 +1,29 @@
+name: Release artifact
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: tar --exclude=node_modules --exclude=data --exclude=test-results --exclude=playwright-report -czf followup-tinder.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: followup-tinder
+          path: followup-tinder.tar.gz
+          if-no-files-found: error

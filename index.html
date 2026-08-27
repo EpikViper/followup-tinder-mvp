@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Followup</title>
+  <meta name="description" content="A focused follow-up queue for the Outbound Pipeline.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="sendpilot.css">
+  <link rel="stylesheet" href="email.css">
+</head>
+<body>
+  <main>
+    <header>
+      <a class="brand" href="/">followup</a>
+      <label class="rep-picker"><span>Working as</span><select id="rep-select" aria-label="Select rep"></select></label>
+      <div class="count" id="count">00 / 00</div>
+      <div class="header-actions"><button class="text-button" id="sync-button">Sync</button><button class="text-button" id="rules-button">Rules</button></div>
+    </header>
+    <div class="progress" aria-label="Follow-up progress"><i id="progress-bar"></i></div>
+    <p class="sync-status" id="sync-status">Connecting to Attio…</p>
+    <section class="deck" aria-live="polite">
+      <div class="card-stack"><div class="shadow-card"></div><article class="lead-card" id="lead-card"></article></div>
+      <nav class="action-rail" aria-label="Company actions">
+        <div class="dismiss-group">
+          <button class="round not-qualified" id="not-qualified-button" title="Not qualified" aria-label="Not qualified"><span aria-hidden="true">×</span><small aria-hidden="true">Not qual</small></button>
+          <button class="round lost" id="lost-button" title="Lost" aria-label="Lost"><span aria-hidden="true">↓</span><small aria-hidden="true">Lost</small></button>
+          <button class="round queue-navigation" id="previous-button" title="Previous company" aria-label="Previous company"><span aria-hidden="true">←</span><small aria-hidden="true">Prev</small></button>
+          <button class="round queue-navigation" id="next-button" title="Next company" aria-label="Next company"><span aria-hidden="true">→</span><small aria-hidden="true">Next</small></button>
+        </div>
+        <div class="primary-group">
+          <button class="pill templates" id="templates-button">Templates</button>
+          <button class="pill email" id="email-button" aria-label="Compose email">Email <span aria-hidden="true">→</span></button>
+          <button class="pill linkedin" id="linkedin-button" aria-label="Follow up on LinkedIn">LinkedIn <span aria-hidden="true">→</span></button>
+        </div>
+      </nav>
+    </section>
+  </main>
+
+  <dialog id="rules-dialog" class="standard-dialog">
+    <button class="close" data-close="rules-dialog" aria-label="Close">×</button>
+    <p class="eyebrow">OUTBOUND PIPELINE SOP</p><h2>Who appears here?</h2>
+    <ol class="rules-list">
+      <li><strong>Unprocessed</strong><span>Every company, always first.</span></li>
+      <li><strong>They replied</strong><span>Qualified companies where the last interaction is from them.</span></li>
+      <li><strong>No show</strong><span>Meeting Booked, First Meeting is No show, and Last Interaction Date is strictly before two days ago.</span></li>
+      <li><strong>Follow-up due</strong><span>Qualified, last interaction is not from them, and Last Interaction Date is strictly before two days ago.</span></li>
+    </ol>
+    <p class="dialog-note">Matches Attio's strict “before 2 days ago” boundary. Replies from Them are immediate. Timezone: Asia/Tbilisi.</p>
+  </dialog>
+
+  <dialog id="composer-dialog" class="composer-dialog">
+    <button class="close" data-close="composer-dialog" aria-label="Close">×</button>
+    <p class="eyebrow" id="composer-source">LINKEDIN FOLLOW-UP</p><h2 id="composer-title">Message contact</h2>
+    <div class="field-label"><span>Sending as</span><div class="sender-options" id="sender-options" role="group" aria-label="Choose sender conversation"></div></div>
+    <section class="thread" id="thread" aria-label="LinkedIn conversation"></section>
+    <label class="field-label">Message<textarea id="message-text" rows="6" maxlength="5000" placeholder="Write your follow-up…"></textarea></label>
+    <div class="dialog-actions split-actions"><button class="secondary" id="composer-templates">Templates</button><button class="primary" id="send-linkedin">Send via SendPilot</button></div>
+  </dialog>
+
+  <dialog id="email-dialog" class="standard-dialog">
+    <button class="close" data-close="email-dialog" aria-label="Close">×</button>
+    <p class="eyebrow" id="email-composer-source">GMAIL COMPOSER</p><h2 id="email-composer-title">Email contact</h2>
+    <label class="field-label">To<input id="email-to" type="email" readonly></label>
+    <label class="field-label">Subject<input id="email-subject" maxlength="500" placeholder="Subject"></label>
+    <label class="field-label">Message<textarea id="email-message" rows="8" maxlength="5000" placeholder="Write your email…"></textarea></label>
+    <div class="dialog-actions split-actions"><button class="secondary" id="email-templates">Templates</button><button class="primary" id="launch-email-composer">Open in Gmail</button></div>
+    <p class="dialog-note">This opens a prefilled draft in a new browser tab. It does not send or complete the card.</p>
+  </dialog>
+
+  <dialog id="templates-dialog" class="standard-dialog templates-dialog">
+    <button class="close" data-close="templates-dialog" aria-label="Close">×</button>
+    <div class="dialog-heading-row"><div><p class="eyebrow">PLAIN TEXT · LOCAL STORAGE</p><h2>Templates</h2></div><button class="plus-button" id="add-template-button" aria-label="Add template">＋</button></div>
+    <form id="template-form" class="template-form hidden">
+      <input type="hidden" id="template-id">
+      <label class="field-label">Name<input id="template-name" maxlength="80" required></label>
+      <label class="field-label">Message<textarea id="template-body" rows="5" maxlength="5000" required></textarea></label>
+      <div class="dialog-actions"><button type="button" class="secondary" id="cancel-template">Cancel</button><button type="submit" class="primary">Save template</button></div>
+    </form>
+    <div id="template-list" class="template-list"></div>
+  </dialog>
+
+  <dialog id="repair-dialog" class="standard-dialog">
+    <button class="close" data-close="repair-dialog" aria-label="Close">×</button>
+    <p class="eyebrow">ATTIO DATA REPAIR</p><h2>Fix interaction</h2>
+    <p class="dialog-note">Use this only when the automatic sync missed a real interaction.</p>
+    <label class="field-label">Direction<select id="repair-direction"><option value="Us">Contacted by us</option><option value="Them">Reply from them</option></select></label>
+    <label class="field-label">Interaction date<input type="date" id="repair-date"></label>
+    <button class="primary full-width" id="save-repair">Update Attio</button>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="standard-dialog confirm-dialog">
+    <p class="eyebrow">CONFIRM</p><h2>Mark not qualified?</h2><p id="confirm-copy" class="dialog-note"></p>
+    <div class="dialog-actions"><button class="secondary" data-close="confirm-dialog">Cancel</button><button class="danger" id="confirm-not-qualified">Not qualified</button></div>
+  </dialog>
+
+  <dialog id="confirm-lost-dialog" class="standard-dialog confirm-dialog">
+    <p class="eyebrow">CONFIRM</p><h2>Mark as lost?</h2><p id="confirm-lost-copy" class="dialog-note"></p>
+    <div class="dialog-actions"><button class="secondary" data-close="confirm-lost-dialog">Cancel</button><button class="danger" id="confirm-lost">Lost</button></div>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
