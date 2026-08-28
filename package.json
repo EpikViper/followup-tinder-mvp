@@ -17,6 +17,7 @@
     "audit:live": "node --env-file-if-exists=.env scripts/live-audit.js",
     "audit:sendpilot": "node --env-file-if-exists=.env scripts/audit-sendpilot-routing.js",
     "audit:sendpilot-matching": "node --env-file-if-exists=.env scripts/audit-sendpilot-matching.js"
+    ,"dedupe:notes": "node --env-file-if-exists=.env scripts/dedupe-attio-notes.js"
   },
   "dependencies": {
     "express": "^5.1.0"

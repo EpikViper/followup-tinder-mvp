@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>LinkedIn → Attio · Reconciler Control Room</title>
+  <meta name="description" content="Detailed nightly and weekly reconciler flow mockup for the Unipile to Attio synchronization saga.">
+  <style>
+    :root {
+      --ink: #17211b;
+      --ink-soft: #415047;
+      --muted: #718078;
+      --line: #dce4df;
+      --line-strong: #c8d3cc;
+      --canvas: #f3f5f1;
+      --paper: #ffffff;
+      --wash: #f8faf7;
+      --night: #172a22;
+      --night-2: #213b30;
+      --lime: #d7f36a;
+      --lime-deep: #809d19;
+      --mint: #dff4e9;
+      --green: #23815a;
+      --amber: #a96413;
+      --amber-bg: #fff3d8;
+      --red: #be4b42;
+      --red-bg: #fff0ed;
+      --blue: #2e659f;
+      --blue-bg: #eaf3fc;
+      --violet: #7054a1;
+      --violet-bg: #f2edfa;
+      --shadow: 0 18px 45px rgba(34, 52, 42, .08);
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; color: var(--ink); background: var(--canvas); font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+    button, select { font: inherit; }
+    button { color: inherit; }
+    button:focus-visible, a:focus-visible, select:focus-visible { outline: 3px solid rgba(128,157,25,.34); outline-offset: 2px; }
+    ::selection { color: var(--night); background: var(--lime); }
+
+    .topbar {
+      position: sticky; top: 0; z-index: 50; height: 66px; display: flex; align-items: center;
+      justify-content: space-between; gap: 24px; padding: 0 28px; color: white; background: var(--night);
+      border-bottom: 1px solid rgba(255,255,255,.1);
+    }
+    .brand { display: flex; align-items: center; min-width: 0; gap: 12px; }
+    .brand-mark { width: 34px; height: 34px; display: grid; place-items: center; color: var(--night); background: var(--lime); border-radius: 9px; font-weight: 900; letter-spacing: -.08em; }
+    .brand strong { display: block; font-size: 13px; letter-spacing: -.01em; }
+    .brand span { display: block; color: #aebdb5; font: 10px/1.3 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .topbar-actions { display: flex; align-items: center; gap: 12px; }
+    .environment { padding: 5px 8px; color: #bcd0c5; border: 1px solid rgba(255,255,255,.14); border-radius: 6px; font: 10px var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .health { display: flex; align-items: center; gap: 8px; color: #dce7e1; font-size: 11px; }
+    .health-dot { width: 8px; height: 8px; border-radius: 50%; background: #65d49a; box-shadow: 0 0 0 4px rgba(101,212,154,.12); }
+
+    .layout { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: calc(100vh - 66px); }
+    .rail { position: sticky; top: 66px; align-self: start; height: calc(100vh - 66px); padding: 24px 16px; background: var(--paper); border-right: 1px solid var(--line); overflow-y: auto; }
+    .rail-label { margin: 0 10px 10px; color: var(--muted); font: 700 9px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .rail-nav { display: grid; gap: 4px; }
+    .rail-nav a { display: grid; grid-template-columns: 24px 1fr auto; align-items: center; gap: 8px; min-height: 38px; padding: 7px 9px; color: var(--ink-soft); border: 1px solid transparent; border-radius: 8px; text-decoration: none; font-size: 12px; }
+    .rail-nav a:hover, .rail-nav a.active { color: var(--ink); background: #f4f7f2; border-color: var(--line); }
+    .nav-icon { width: 22px; height: 22px; display: grid; place-items: center; color: var(--muted); background: white; border: 1px solid var(--line); border-radius: 6px; font: 700 10px var(--mono); }
+    .nav-count { color: var(--muted); font: 10px var(--mono); }
+    .rail-card { margin-top: 26px; padding: 13px; color: #d8e4de; background: var(--night); border-radius: 10px; }
+    .rail-card b { display: block; color: white; font-size: 11px; }
+    .rail-card p { margin: 5px 0 10px; color: #aebdb5; font-size: 10px; }
+    .rail-card code { display: block; overflow: hidden; color: var(--lime); font: 9px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+
+    main { min-width: 0; padding: 30px clamp(22px, 3.5vw, 52px) 72px; }
+    .content { max-width: 1220px; margin: 0 auto; }
+    .eyebrow { margin: 0 0 7px; color: var(--green); font: 800 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .hero { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(330px, .6fr); gap: 24px; margin-bottom: 20px; }
+    .hero-copy { min-width: 0; padding: 7px 0; }
+    .hero h1 { max-width: 740px; margin: 0; font-size: clamp(30px, 4.4vw, 52px); line-height: 1.03; letter-spacing: -.055em; }
+    .hero-copy > p:not(.eyebrow) { max-width: 720px; margin: 14px 0 0; color: var(--muted); font-size: 15px; }
+    .mode-card { padding: 18px; color: white; background: linear-gradient(145deg, var(--night), var(--night-2)); border-radius: 14px; box-shadow: var(--shadow); }
+    .mode-card-label { display: flex; justify-content: space-between; color: #acbdb4; font: 9px var(--mono); letter-spacing: .09em; text-transform: uppercase; }
+    .segmented { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 13px 0; padding: 4px; background: rgba(255,255,255,.08); border-radius: 9px; }
+    .segmented button { padding: 8px; color: #b9c8c0; background: transparent; border: 0; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 750; }
+    .segmented button[aria-pressed="true"] { color: var(--night); background: var(--lime); box-shadow: 0 2px 10px rgba(0,0,0,.16); }
+    .mode-time { margin: 0; font-size: 19px; font-weight: 760; letter-spacing: -.02em; }
+    .mode-window { margin: 5px 0 14px; color: #adbbb4; font-size: 11px; }
+    .preview-button { width: 100%; padding: 10px 12px; color: white; background: transparent; border: 1px solid rgba(255,255,255,.22); border-radius: 8px; cursor: pointer; font-size: 11px; font-weight: 700; }
+    .preview-button:hover { border-color: var(--lime); color: var(--lime); }
+
+    .run-strip { display: grid; grid-template-columns: 1.15fr repeat(4, 1fr); margin-bottom: 22px; overflow: hidden; background: var(--paper); border: 1px solid var(--line); border-radius: 12px; }
+    .run-lead, .metric { min-width: 0; padding: 14px 16px; }
+    .metric { border-left: 1px solid var(--line); }
+    .run-lead { display: flex; align-items: center; gap: 11px; }
+    .run-state { width: 32px; height: 32px; display: grid; place-items: center; flex: 0 0 auto; color: var(--green); background: var(--mint); border-radius: 50%; font-weight: 900; }
+    .run-lead b, .metric b { display: block; font-size: 13px; }
+    .run-lead span, .metric span { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
+    .metric b { font-family: var(--mono); }
+
+    .section { margin-top: 34px; scroll-margin-top: 88px; }
+    .section-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 14px; }
+    .section-head h2 { margin: 0; font-size: 22px; letter-spacing: -.035em; }
+    .section-head p { max-width: 650px; margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+    .section-tag { flex: 0 0 auto; padding: 6px 8px; color: var(--muted); background: white; border: 1px solid var(--line); border-radius: 6px; font: 9px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+
+    .scenario-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 12px; }
+    .scenario-label { margin-right: 4px; color: var(--muted); font: 9px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .scenario { padding: 7px 10px; color: var(--ink-soft); background: white; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; font-size: 10px; }
+    .scenario[aria-pressed="true"] { color: white; background: var(--night); border-color: var(--night); }
+
+    .flow-board { position: relative; padding: 18px; background: #e8ede8; border: 1px solid var(--line-strong); border-radius: 16px; }
+    .flow-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 30px 18px; }
+    .flow-node { position: relative; min-width: 0; min-height: 146px; padding: 14px; text-align: left; background: var(--paper); border: 1px solid var(--line-strong); border-radius: 11px; box-shadow: 0 4px 14px rgba(26,45,34,.045); cursor: pointer; transition: border-color .15s, transform .15s, box-shadow .15s; }
+    .flow-node:hover { transform: translateY(-2px); border-color: #a9baaf; box-shadow: 0 8px 22px rgba(26,45,34,.09); }
+    .flow-node::after { content: "→"; position: absolute; top: 50%; right: -23px; width: 27px; color: #809087; font: 700 18px var(--mono); text-align: center; transform: translateY(-50%); }
+    .flow-node:nth-child(4)::after { content: "↓"; top: auto; right: 50%; bottom: -29px; transform: translateX(50%); }
+    .flow-node:nth-child(5) { grid-column: 4; grid-row: 2; }
+    .flow-node:nth-child(6) { grid-column: 3; grid-row: 2; }
+    .flow-node:nth-child(7) { grid-column: 2; grid-row: 2; }
+    .flow-node:nth-child(8) { grid-column: 1; grid-row: 2; }
+    .flow-node:nth-child(5)::after, .flow-node:nth-child(6)::after, .flow-node:nth-child(7)::after { content: "←"; left: -23px; right: auto; }
+    .flow-node:nth-child(8)::after { content: "↓"; top: auto; right: 50%; bottom: -29px; transform: translateX(50%); }
+    .flow-node:nth-child(9) { grid-column: 1; grid-row: 3; }
+    .flow-node:nth-child(10) { grid-column: 2; grid-row: 3; }
+    .flow-node:nth-child(11) { grid-column: 3; grid-row: 3; }
+    .flow-node:nth-child(12) { grid-column: 4; grid-row: 3; }
+    .flow-node:nth-child(12)::after { display: none; }
+    .node-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .node-id { color: var(--muted); font: 9px var(--mono); letter-spacing: .05em; }
+    .node-status { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font: 8px var(--mono); letter-spacing: .04em; text-transform: uppercase; }
+    .node-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .node-status.warn { color: var(--amber); }
+    .node-status.fail { color: var(--red); }
+    .node-status.wait { color: var(--violet); }
+    .flow-node h3 { margin: 19px 0 5px; font-size: 13px; line-height: 1.25; letter-spacing: -.01em; }
+    .flow-node p { margin: 0; color: var(--muted); font-size: 10px; }
+    .node-foot { position: absolute; left: 14px; right: 14px; bottom: 12px; display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font: 9px var(--mono); }
+    .node-foot strong { color: var(--ink-soft); }
+    .flow-legend { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #cad4cd; color: var(--muted); font-size: 9px; }
+    .flow-legend span { display: flex; align-items: center; gap: 6px; }
+    .legend-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+
+    .drawer { position: fixed; z-index: 80; top: 66px; right: 0; bottom: 0; width: min(460px, 100vw); padding: 26px; background: white; border-left: 1px solid var(--line); box-shadow: -24px 0 60px rgba(19,34,25,.13); transform: translateX(104%); transition: transform .2s ease; overflow-y: auto; }
+    .drawer.open { transform: translateX(0); }
+    .drawer-close { float: right; width: 32px; height: 32px; color: var(--muted); background: white; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+    .drawer-kicker { margin: 3px 0 8px; color: var(--green); font: 800 9px var(--mono); letter-spacing: .09em; text-transform: uppercase; }
+    .drawer h2 { margin: 0 44px 8px 0; font-size: 24px; letter-spacing: -.04em; }
+    .drawer-summary { color: var(--muted); font-size: 12px; }
+    .drawer-block { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+    .drawer-block h3 { margin: 0 0 9px; font-size: 11px; letter-spacing: .02em; }
+    .drawer-block ul { margin: 0; padding-left: 18px; color: var(--ink-soft); font-size: 11px; }
+    .drawer-block li + li { margin-top: 7px; }
+    .io-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .io-card { min-width: 0; padding: 10px; background: var(--wash); border: 1px solid var(--line); border-radius: 8px; }
+    .io-card span { display: block; margin-bottom: 4px; color: var(--muted); font: 8px var(--mono); text-transform: uppercase; }
+    .io-card code { display: block; overflow-wrap: anywhere; color: var(--ink-soft); font: 9px/1.5 var(--mono); }
+    .drawer-note { margin-top: 20px; padding: 12px; color: #72500e; background: var(--amber-bg); border: 1px solid #edd28d; border-radius: 8px; font-size: 10px; }
+    .scrim { position: fixed; z-index: 70; inset: 66px 0 0; background: rgba(19,34,25,.24); opacity: 0; pointer-events: none; transition: opacity .2s; }
+    .scrim.open { opacity: 1; pointer-events: auto; }
+
+    .detail-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 14px; }
+    .card { min-width: 0; background: white; border: 1px solid var(--line); border-radius: 13px; box-shadow: 0 3px 12px rgba(29,47,36,.035); }
+    .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 15px 16px; border-bottom: 1px solid var(--line); }
+    .card-head h3 { margin: 0; font-size: 13px; }
+    .card-head p { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
+    .card-body { padding: 16px; }
+    .envelope { display: grid; grid-template-columns: 132px minmax(0, 1fr); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+    .envelope dt, .envelope dd { margin: 0; padding: 9px 11px; border-bottom: 1px solid var(--line); font: 9px/1.45 var(--mono); }
+    .envelope dt { color: var(--muted); background: var(--wash); }
+    .envelope dd { min-width: 0; overflow-wrap: anywhere; color: var(--ink-soft); }
+    .envelope dt:last-of-type, .envelope dd:last-of-type { border-bottom: 0; }
+    .policy-list { display: grid; gap: 10px; }
+    .policy { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; }
+    .policy-no { width: 28px; height: 28px; display: grid; place-items: center; color: var(--green); background: var(--mint); border-radius: 8px; font: 800 9px var(--mono); }
+    .policy b { display: block; font-size: 11px; }
+    .policy p { margin: 2px 0 0; color: var(--muted); font-size: 10px; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; white-space: nowrap; }
+    th { color: var(--muted); background: var(--wash); font: 800 8px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    td { color: var(--ink-soft); font-size: 10px; }
+    tr:last-child td { border-bottom: 0; }
+    td code { font: 9px var(--mono); }
+    .person-cell { display: flex; align-items: center; gap: 9px; }
+    .avatar { width: 27px; height: 27px; display: grid; place-items: center; color: var(--night); background: #e5ebdf; border-radius: 50%; font-size: 9px; font-weight: 800; }
+    .person-cell b { display: block; color: var(--ink); font-size: 10px; }
+    .person-cell span { display: block; color: var(--muted); font-size: 8px; }
+    .status { display: inline-flex; align-items: center; gap: 5px; padding: 4px 6px; border-radius: 5px; font: 800 8px var(--mono); text-transform: uppercase; }
+    .status::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+    .status.completed { color: var(--green); background: var(--mint); }
+    .status.processing { color: var(--blue); background: var(--blue-bg); }
+    .status.waiting { color: var(--violet); background: var(--violet-bg); }
+    .status.failed { color: var(--red); background: var(--red-bg); }
+    .row-action { padding: 5px 8px; color: var(--ink-soft); background: white; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; font-size: 9px; }
+
+    .ledger-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .filters { display: flex; gap: 5px; }
+    .filter { padding: 5px 7px; color: var(--muted); background: white; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; font-size: 9px; }
+    .filter[aria-pressed="true"] { color: white; background: var(--night); border-color: var(--night); }
+    .table-meta { color: var(--muted); font: 9px var(--mono); }
+
+    .saga { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; padding: 22px 18px 18px; }
+    .saga-step { position: relative; min-width: 0; text-align: center; }
+    .saga-step:not(:last-child)::after { content: ""; position: absolute; top: 17px; left: 56%; width: 88%; height: 2px; background: var(--line-strong); }
+    .saga-dot { position: relative; z-index: 2; width: 34px; height: 34px; display: grid; place-items: center; margin: 0 auto 9px; color: var(--green); background: var(--mint); border: 1px solid #b7e0cb; border-radius: 50%; font: 800 9px var(--mono); }
+    .saga-step.commit .saga-dot { color: var(--night); background: var(--lime); border-color: #bedb4e; box-shadow: 0 0 0 5px rgba(215,243,106,.23); }
+    .saga-step h4 { margin: 0; font-size: 10px; }
+    .saga-step p { margin: 4px auto 0; max-width: 145px; color: var(--muted); font-size: 9px; }
+    .commit-label { display: inline-block; margin-top: 7px; padding: 3px 5px; color: #536313; background: #eef7c3; border-radius: 4px; font: 800 7px var(--mono); letter-spacing: .04em; text-transform: uppercase; }
+    .failure-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; padding: 0 16px 16px; }
+    .failure { padding: 11px; border: 1px solid var(--line); border-radius: 8px; }
+    .failure b { display: block; font-size: 9px; }
+    .failure p { margin: 3px 0 0; color: var(--muted); font-size: 9px; }
+    .failure.rollback { background: var(--red-bg); border-color: #efc3bd; }
+    .failure.retry { background: var(--amber-bg); border-color: #ecd08b; }
+    .failure.safe { background: var(--mint); border-color: #bfe3d1; }
+
+    .schedule-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .schedule-card { padding: 18px; background: white; border: 1px solid var(--line); border-radius: 13px; }
+    .schedule-card.featured { color: white; background: var(--night); border-color: var(--night); }
+    .schedule-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .schedule-card h3 { margin: 0; font-size: 15px; }
+    .schedule-card .cron { margin: 3px 0 0; color: var(--muted); font: 9px var(--mono); }
+    .schedule-card.featured .cron, .schedule-card.featured .schedule-copy { color: #b7c5bd; }
+    .schedule-window { padding: 6px 8px; color: var(--green); background: var(--mint); border-radius: 6px; font: 800 9px var(--mono); }
+    .schedule-card.featured .schedule-window { color: var(--night); background: var(--lime); }
+    .schedule-copy { margin: 16px 0; color: var(--muted); font-size: 10px; }
+    .schedule-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+    .schedule-list li { display: flex; justify-content: space-between; gap: 12px; padding-top: 7px; border-top: 1px solid var(--line); font-size: 9px; }
+    .schedule-card.featured .schedule-list li { border-color: rgba(255,255,255,.12); }
+    .schedule-list span { color: var(--muted); }
+    .schedule-card.featured .schedule-list span { color: #adbbb4; }
+
+    .guard-card { margin-top: 14px; padding: 16px; color: #4f3b10; background: var(--amber-bg); border: 1px solid #e8ca80; border-radius: 11px; }
+    .guard-card b { display: block; font-size: 11px; }
+    .guard-card p { margin: 4px 0 0; font-size: 10px; }
+
+    .history-list { display: grid; }
+    .history-row { display: grid; grid-template-columns: 130px 1fr 100px 100px 82px; align-items: center; gap: 12px; padding: 12px 15px; border-bottom: 1px solid var(--line); font-size: 10px; }
+    .history-row:last-child { border-bottom: 0; }
+    .history-row.header { color: var(--muted); background: var(--wash); font: 800 8px var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .run-id { color: var(--ink); font: 9px var(--mono); }
+    .run-id span { display: block; margin-top: 2px; color: var(--muted); font: 8px var(--sans); }
+    .bar { height: 5px; overflow: hidden; background: #edf1ee; border-radius: 99px; }
+    .bar i { display: block; height: 100%; background: var(--green); border-radius: inherit; }
+
+    .toast { position: fixed; z-index: 100; right: 24px; bottom: 24px; max-width: 360px; padding: 12px 14px; color: white; background: var(--night); border: 1px solid rgba(255,255,255,.12); border-radius: 9px; box-shadow: var(--shadow); opacity: 0; transform: translateY(12px); pointer-events: none; transition: .18s; font-size: 11px; }
+    .toast.show { opacity: 1; transform: none; }
+    .toast b { color: var(--lime); }
+    .running .flow-node { opacity: .42; }
+    .running .flow-node.run-active { opacity: 1; border-color: var(--lime-deep); box-shadow: 0 0 0 3px rgba(215,243,106,.4); }
+
+    @media (max-width: 1040px) {
+      .run-strip { grid-template-columns: 1.2fr repeat(2, 1fr); }
+      .run-strip .metric:nth-child(4), .run-strip .metric:nth-child(5) { border-top: 1px solid var(--line); }
+      .run-strip .metric:nth-child(4) { border-left: 0; }
+      .flow-grid { grid-template-columns: repeat(3, 1fr); }
+      .flow-node { grid-column: auto !important; grid-row: auto !important; }
+      .flow-node:nth-child(n)::after { content: "→"; top: 50%; right: -23px; bottom: auto; left: auto; transform: translateY(-50%); display: block; }
+      .flow-node:nth-child(3n)::after { content: "↓"; top: auto; right: 50%; bottom: -29px; transform: translateX(50%); }
+      .flow-node:last-child::after { display: none; }
+    }
+    @media (max-width: 800px) {
+      .layout { display: block; }
+      .rail { position: static; width: 100%; height: auto; padding: 9px 14px; border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+      .rail-label, .rail-card { display: none; }
+      .rail-nav { display: flex; width: max-content; }
+      .rail-nav a { grid-template-columns: 20px 1fr; }
+      .nav-count { display: none; }
+      main { padding-top: 24px; }
+      .hero, .detail-grid, .schedule-grid { grid-template-columns: 1fr; }
+      .mode-card { max-width: none; }
+      .run-strip { grid-template-columns: 1fr 1fr; }
+      .run-lead { grid-column: 1 / -1; }
+      .run-strip .metric { border-top: 1px solid var(--line); }
+      .run-strip .metric:nth-child(even) { border-left: 0; }
+      .flow-grid { grid-template-columns: repeat(2, 1fr); }
+      .flow-node:nth-child(n)::after { content: "→"; top: 50%; right: -23px; bottom: auto; transform: translateY(-50%); }
+      .flow-node:nth-child(2n)::after { content: "↓"; top: auto; right: 50%; bottom: -29px; transform: translateX(50%); }
+      .saga { grid-template-columns: 1fr; gap: 12px; }
+      .saga-step { display: grid; grid-template-columns: 40px 1fr; gap: 10px; text-align: left; }
+      .saga-step:not(:last-child)::after { top: 32px; bottom: -18px; left: 16px; width: 2px; height: auto; }
+      .saga-dot { margin: 0; }
+      .saga-step p { max-width: none; margin-left: 0; }
+      .failure-grid { grid-template-columns: 1fr; }
+      .history-row { grid-template-columns: 120px 1fr 78px; }
+      .history-row > *:nth-child(3), .history-row > *:nth-child(4) { display: none; }
+    }
+    @media (max-width: 540px) {
+      .topbar { height: 60px; padding: 0 15px; }
+      .brand span, .environment { display: none; }
+      .layout { min-height: calc(100vh - 60px); }
+      main { padding: 22px 13px 52px; }
+      .hero h1 { font-size: 34px; }
+      .run-strip { grid-template-columns: 1fr; }
+      .run-strip .metric { border-left: 0; }
+      .run-lead { grid-column: auto; }
+      .section-head { align-items: flex-start; }
+      .section-tag { display: none; }
+      .flow-board { padding: 12px; }
+      .flow-grid { grid-template-columns: 1fr; gap: 24px; }
+      .flow-node:nth-child(n)::after { content: "↓"; top: auto; right: 50%; bottom: -23px; transform: translateX(50%); }
+      .flow-node:last-child::after { display: none; }
+      .envelope { grid-template-columns: 104px minmax(0,1fr); }
+      .io-grid { grid-template-columns: 1fr; }
+      .drawer { top: 60px; padding: 20px; }
+      .scrim { top: 60px; }
+    }
+    @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; animation: none !important; transition: none !important; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">R</div>
+      <div><strong>Reconciler control room</strong><span>Unipile → Attio · shared durable saga</span></div>
+    </div>
+    <div class="topbar-actions">
+      <span class="environment">Production model</span>
+      <span class="health"><i class="health-dot" aria-hidden="true"></i> Healthy</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="rail" aria-label="Page sections">
+      <p class="rail-label">Reconciler anatomy</p>
+      <nav class="rail-nav">
+        <a class="active" href="#overview"><span class="nav-icon">01</span><span>Run overview</span><span class="nav-count">12</span></a>
+        <a href="#flow"><span class="nav-icon">02</span><span>Flow map</span><span class="nav-count">12</span></a>
+        <a href="#event"><span class="nav-icon">03</span><span>Event envelope</span><span class="nav-count">14</span></a>
+        <a href="#ledgers"><span class="nav-icon">04</span><span>Durable ledgers</span><span class="nav-count">3</span></a>
+        <a href="#transcript"><span class="nav-icon">05</span><span>Transcript saga</span><span class="nav-count">5</span></a>
+        <a href="#schedule"><span class="nav-icon">06</span><span>Schedule policy</span><span class="nav-count">2</span></a>
+        <a href="#history"><span class="nav-icon">07</span><span>Run history</span><span class="nav-count">6</span></a>
+      </nav>
+      <div class="rail-card">
+        <b>Single source of truth</b>
+        <p>Nightly and weekly discovery both hand normalized events to the same processor used by the live webhook.</p>
+        <code>GXEe3WPRaPhgoiBC</code>
+      </div>
+    </aside>
+
+    <main>
+      <div class="content">
+        <section class="hero" id="overview">
+          <div class="hero-copy">
+            <p class="eyebrow">Reconciliation, not reimplementation</p>
+            <h1>Find the gaps. Resume the saga. Never move CRM state backward.</h1>
+            <p>The scheduled path discovers missed LinkedIn messages and incomplete ledger events, then feeds both through the same identity, company, and mutation logic as the live webhook.</p>
+          </div>
+          <aside class="mode-card" aria-label="Run mode controls">
+            <div class="mode-card-label"><span>Inspect run profile</span><span id="mode-cron">0 3 * * 1–6</span></div>
+            <div class="segmented" role="group" aria-label="Choose reconciliation mode">
+              <button type="button" data-mode="nightly" aria-pressed="true">Nightly</button>
+              <button type="button" data-mode="weekly" aria-pressed="false">Weekly sweep</button>
+            </div>
+            <p class="mode-time" id="mode-title">Mon–Sat · 03:00</p>
+            <p class="mode-window" id="mode-description">Rolling 26-hour overlap · all allowed accounts</p>
+            <button class="preview-button" id="preview-run" type="button">Play annotated run preview</button>
+          </aside>
+        </section>
+
+        <section class="run-strip" aria-label="Run summary">
+          <div class="run-lead"><span class="run-state" id="run-state">✓</span><div><b id="run-label">Nightly run completed</b><span id="run-subtitle">27 Aug 2026 · 03:00:04–03:04:43</span></div></div>
+          <div class="metric"><b id="metric-chats">318</b><span>eligible 1:1 chats</span></div>
+          <div class="metric"><b id="metric-events">762</b><span>unique events checked</span></div>
+          <div class="metric"><b id="metric-repaired">9</b><span>events repaired</span></div>
+          <div class="metric"><b id="metric-duration">04:39</b><span>wall-clock duration</span></div>
+        </section>
+
+        <section class="section" id="flow">
+          <div class="section-head"><div><p class="eyebrow">End-to-end path</p><h2>The scheduled discovery and recovery flow</h2><p>Select a node to inspect its input, output, safeguards, and failure behavior. Use a scenario to see where a run branches.</p></div><span class="section-tag">12 observable stages</span></div>
+          <div class="scenario-bar" role="group" aria-label="Preview flow scenario">
+            <span class="scenario-label">Scenario</span>
+            <button type="button" class="scenario" data-scenario="normal" aria-pressed="true">Routine overlap</button>
+            <button type="button" class="scenario" data-scenario="missed" aria-pressed="false">Missed webhook events</button>
+            <button type="button" class="scenario" data-scenario="stale" aria-pressed="false">Stale failed saga</button>
+            <button type="button" class="scenario" data-scenario="truncated" aria-pressed="false">10k history cap</button>
+          </div>
+
+          <div class="flow-board" id="flow-board">
+            <div class="flow-grid">
+              <button class="flow-node" type="button" data-node="trigger"><span class="node-top"><span class="node-id">01 / TRIGGER</span><span class="node-status">done</span></span><h3>Choose run window</h3><p>Nightly overlap or weekly sweep establishes the discovery horizon.</p><span class="node-foot"><span>schedule</span><strong id="node-window">26h</strong></span></button>
+              <button class="flow-node" type="button" data-node="accounts"><span class="node-top"><span class="node-id">02 / SCOPE</span><span class="node-status">done</span></span><h3>Load account allowlist</h3><p>Query only the three configured LinkedIn mailboxes.</p><span class="node-foot"><span>accounts</span><strong>3 / 3</strong></span></button>
+              <button class="flow-node" type="button" data-node="chats"><span class="node-top"><span class="node-id">03 / UNIPILE</span><span class="node-status">done</span></span><h3>Paginate chat index</h3><p>Walk cursors until the selected window is exhausted.</p><span class="node-foot"><span>eligible</span><strong id="node-chats">318</strong></span></button>
+              <button class="flow-node" type="button" data-node="filter"><span class="node-top"><span class="node-id">04 / FILTER</span><span class="node-status">done</span></span><h3>Keep one-to-one threads</h3><p>Reject groups, disallowed accounts, and unusable counterpart records.</p><span class="node-foot"><span>rejected</span><strong id="node-rejected">14</strong></span></button>
+              <button class="flow-node" type="button" data-node="identity"><span class="node-top"><span class="node-id">05 / IDENTITY</span><span class="node-status">done</span></span><h3>Attach counterpart evidence</h3><p>Retain provider ID, canonical profile URL, display name, and headline.</p><span class="node-foot"><span>complete</span><strong id="node-identity">97.8%</strong></span></button>
+              <button class="flow-node" type="button" data-node="history"><span class="node-top"><span class="node-id">06 / HISTORY</span><span class="node-status" id="history-status">done</span></span><h3>Load full chat history</h3><p>Paginate with cursors, dedupe by message ID, sort oldest to newest.</p><span class="node-foot"><span>events</span><strong id="node-events">762</strong></span></button>
+              <button class="flow-node" type="button" data-node="envelope"><span class="node-top"><span class="node-id">07 / NORMALIZE</span><span class="node-status">done</span></span><h3>Expand event envelopes</h3><p>Preserve text or attachment label and the original payload reference.</p><span class="node-foot"><span>attachment-only</span><strong id="node-attachments">11</strong></span></button>
+              <button class="flow-node" type="button" data-node="ledger"><span class="node-top"><span class="node-id">08 / LEDGER</span><span class="node-status" id="ledger-status">done</span></span><h3>Coalesce delivery rows</h3><p>Ignore only completed keys; resume failed or stale work from checkpoints.</p><span class="node-foot"><span>to process</span><strong id="node-process">9</strong></span></button>
+              <button class="flow-node" type="button" data-node="resolver"><span class="node-top"><span class="node-id">09 / RESOLVE</span><span class="node-status" id="resolver-status">done</span></span><h3>Run shared resolver</h3><p>URN → URL → unique name → bounded review → qualification.</p><span class="node-foot"><span>review cases</span><strong id="node-reviews">2</strong></span></button>
+              <button class="flow-node" type="button" data-node="mutation"><span class="node-top"><span class="node-id">10 / MUTATE</span><span class="node-status" id="mutation-status">done</span></span><h3>Resume mutation saga</h3><p>Commit identity, company, pipeline, guarded state, and transcript steps.</p><span class="node-foot"><span>repaired</span><strong id="node-repaired">9</strong></span></button>
+              <button class="flow-node" type="button" data-node="recovery"><span class="node-top"><span class="node-id">11 / RECOVER</span><span class="node-status" id="recovery-status">done</span></span><h3>Retry incomplete ledgers</h3><p>Scan failed and stale rows independently of discovered chat messages.</p><span class="node-foot"><span>resumed</span><strong id="node-resumed">3</strong></span></button>
+              <button class="flow-node" type="button" data-node="complete"><span class="node-top"><span class="node-id">12 / COMMIT</span><span class="node-status" id="complete-status">done</span></span><h3>Commit observable state</h3><p>Mark outcomes, retain errors, and alert if any history was truncated.</p><span class="node-foot"><span>remaining failed</span><strong id="node-failed">0</strong></span></button>
+            </div>
+            <div class="flow-legend"><span><i class="legend-dot"></i> completed / healthy</span><span><i class="legend-dot" style="background:var(--amber)"></i> warning / bounded continuation</span><span><i class="legend-dot" style="background:var(--violet)"></i> waiting for human review</span><span><i class="legend-dot" style="background:var(--red)"></i> failed / resumable</span><span>Arrows indicate orchestration order, not synchronous transactions.</span></div>
+          </div>
+        </section>
+
+        <section class="section" id="event">
+          <div class="section-head"><div><p class="eyebrow">Shared interface</p><h2>Every source becomes the same event</h2><p>The reconciler does not maintain its own person or company rules. It constructs the processor envelope used by the live path.</p></div><span class="section-tag">Immutable source facts</span></div>
+          <div class="detail-grid">
+            <article class="card">
+              <div class="card-head"><div><h3>Normalized event envelope</h3><p>Example inbound attachment-only message recovered during overlap.</p></div><span class="status completed">valid</span></div>
+              <div class="card-body">
+                <dl class="envelope">
+                  <dt>event_key</dt><dd>acc_sandro:msg_01J6YF6TKR</dd>
+                  <dt>account_id</dt><dd>acc_sandro</dd>
+                  <dt>chat_id / message_id</dt><dd>chat_8f92b1 / msg_01J6YF6TKR</dd>
+                  <dt>timestamp</dt><dd>2026-08-27T00:41:18.000Z</dd>
+                  <dt>direction</dt><dd>inbound</dd>
+                  <dt>text</dt><dd>[Attachment: application/pdf]</dd>
+                  <dt>counterpart</dt><dd>{ provider_id, profile_url, display_name, headline }</dd>
+                  <dt>original_payload_ref</dt><dd>unipile://acc_sandro/chat_8f92b1/msg_01J6YF6TKR</dd>
+                </dl>
+              </div>
+            </article>
+            <article class="card">
+              <div class="card-head"><div><h3>Processing invariants</h3><p>Rules that make retries safe across live and scheduled paths.</p></div></div>
+              <div class="card-body policy-list">
+                <div class="policy"><span class="policy-no">01</span><div><b>Completed is the only terminal duplicate</b><p>Processing, failed, waiting-review, and stale rows are never silently discarded.</p></div></div>
+                <div class="policy"><span class="policy-no">02</span><div><b>Event time guards all activity writes</b><p>Older messages can repair transcripts without rewinding date or direction.</p></div></div>
+                <div class="policy"><span class="policy-no">03</span><div><b>Checkpoint after meaningful side effects</b><p>Attempts, completed steps, outputs, and errors survive between runs.</p></div></div>
+                <div class="policy"><span class="policy-no">04</span><div><b>Human review remains a durable state</b><p>Partial or conflicting identity and ambiguous company results wait in one case.</p></div></div>
+                <div class="policy"><span class="policy-no">05</span><div><b>10,000 is an explicit ceiling</b><p>Truncated history is labeled and alerted; it is never represented as complete.</p></div></div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="section" id="ledgers">
+          <div class="section-head"><div><p class="eyebrow">Durable processing</p><h2>Three ledgers, three responsibilities</h2><p>Event delivery, human review cases, and per-chat commit state are independently queryable and recoverable.</p></div><span class="section-tag">n8n Data Tables</span></div>
+          <article class="card">
+            <div class="ledger-toolbar">
+              <div class="filters" role="group" aria-label="Filter event ledger"><button class="filter" type="button" data-filter="all" aria-pressed="true">All 8</button><button class="filter" type="button" data-filter="completed" aria-pressed="false">Completed</button><button class="filter" type="button" data-filter="waiting" aria-pressed="false">Waiting</button><button class="filter" type="button" data-filter="failed" aria-pressed="false">Failed</button></div>
+              <span class="table-meta">event ledger · account_id:message_id</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Counterpart</th><th>Event key</th><th>Status</th><th>Attempt</th><th>Last committed step</th><th>Event time</th><th></th></tr></thead>
+                <tbody id="ledger-rows">
+                  <tr data-status="completed"><td><div class="person-cell"><span class="avatar">HA</span><div><b>Hamza Ahmed</b><span>Aperture Labs</span></div></div></td><td><code>acc_sandro:…F6TKR</code></td><td><span class="status completed">completed</span></td><td>1</td><td>transcript_committed</td><td>00:41:18</td><td><button class="row-action" type="button" data-node-open="complete">Inspect</button></td></tr>
+                  <tr data-status="waiting"><td><div class="person-cell"><span class="avatar">MP</span><div><b>Marta P.</b><span>Company unresolved</span></div></div></td><td><code>acc_vakhtang:…CA0J</code></td><td><span class="status waiting">waiting review</span></td><td>1</td><td>case_parent_opened</td><td>00:33:02</td><td><button class="row-action" type="button" data-node-open="resolver">Review</button></td></tr>
+                  <tr data-status="failed"><td><div class="person-cell"><span class="avatar">NK</span><div><b>Nika Kapanadze</b><span>Northstar</span></div></div></td><td><code>acc_sandro:…86NQ</code></td><td><span class="status failed">failed</span></td><td>3</td><td>replacement_created</td><td>23:58:44</td><td><button class="row-action" type="button" data-node-open="mutation">Resume</button></td></tr>
+                  <tr data-status="completed"><td><div class="person-cell"><span class="avatar">LC</span><div><b>Lena Chen</b><span>Grain & Co.</span></div></div></td><td><code>acc_ilia:…P20S</code></td><td><span class="status completed">completed</span></td><td>2</td><td>old_note_cleaned</td><td>23:47:10</td><td><button class="row-action" type="button" data-node-open="recovery">Inspect</button></td></tr>
+                  <tr data-status="processing"><td><div class="person-cell"><span class="avatar">AB</span><div><b>Andrei B.</b><span>Vela Systems</span></div></div></td><td><code>acc_vakhtang:…DD7W</code></td><td><span class="status processing">processing</span></td><td>1</td><td>identity_resolved</td><td>23:41:38</td><td><button class="row-action" type="button" data-node-open="ledger">Inspect</button></td></tr>
+                  <tr data-status="completed"><td><div class="person-cell"><span class="avatar">SD</span><div><b>Sofia Dimitri</b><span>Tangent</span></div></div></td><td><code>acc_ilia:…D2L9</code></td><td><span class="status completed">completed</span></td><td>1</td><td>interaction_guarded</td><td>23:28:51</td><td><button class="row-action" type="button" data-node-open="mutation">Inspect</button></td></tr>
+                  <tr data-status="waiting"><td><div class="person-cell"><span class="avatar">OJ</span><div><b>Omar J.</b><span>Two company matches</span></div></div></td><td><code>acc_sandro:…F11M</code></td><td><span class="status waiting">waiting review</span></td><td>2</td><td>company_ambiguous</td><td>23:19:05</td><td><button class="row-action" type="button" data-node-open="resolver">Review</button></td></tr>
+                  <tr data-status="completed"><td><div class="person-cell"><span class="avatar">EM</span><div><b>Elene M.</b><span>Kite Analytics</span></div></div></td><td><code>acc_vakhtang:…Z9KF</code></td><td><span class="status completed">completed</span></td><td>1</td><td>event_completed</td><td>22:55:29</td><td><button class="row-action" type="button" data-node-open="complete">Inspect</button></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+          <div class="detail-grid" style="margin-top:14px">
+            <article class="card"><div class="card-head"><div><h3>Case ledger</h3><p>One Slack parent per account + chat + reason.</p></div><span class="status waiting">2 open</span></div><div class="card-body policy-list"><div class="policy"><span class="policy-no">ID</span><div><b>acc_vakhtang:chat_442:identity_conflict</b><p>3 messages · latest preview updated · Same person / Different person.</p></div></div><div class="policy"><span class="policy-no">CO</span><div><b>acc_sandro:chat_8a1:company_missing</b><p>2 messages · inbound-only · Not qualified / Qualified.</p></div></div></div></article>
+            <article class="card"><div class="card-head"><div><h3>Chat/company state</h3><p>Monotonic activity and transcript pointer.</p></div><span class="status completed">current</span></div><div class="card-body"><dl class="envelope"><dt>state key</dt><dd>acc_sandro:chat_8f92b1:company_31d</dd><dt>newest committed</dt><dd>2026-08-27T00:41:18.000Z</dd><dt>direction</dt><dd>Them</dd><dt>canonical note</dt><dd>note_8cc31f</dd><dt>cleanup pending</dt><dd>false</dd></dl></div></article>
+          </div>
+        </section>
+
+        <section class="section" id="transcript">
+          <div class="section-head"><div><p class="eyebrow">Failure-atomic replacement</p><h2>The pointer is the commit point</h2><p>The transcript can span multiple Attio requests without exposing a missing or ambiguous canonical note.</p></div><span class="section-tag">Recoverable saga</span></div>
+          <article class="card">
+            <div class="saga">
+              <div class="saga-step"><span class="saga-dot">01</span><div><h4>Read old pointer</h4><p>Capture the current per-chat note ID before mutation.</p></div></div>
+              <div class="saga-step"><span class="saga-dot">02</span><div><h4>Create replacement</h4><p>Build the complete chronological transcript first.</p></div></div>
+              <div class="saga-step commit"><span class="saga-dot">03</span><div><h4>Update pointer</h4><p>Make the new note canonical in company chat state.</p><span class="commit-label">commit point</span></div></div>
+              <div class="saga-step"><span class="saga-dot">04</span><div><h4>Delete old note</h4><p>Cleanup happens only after the canonical pointer moves.</p></div></div>
+              <div class="saga-step"><span class="saga-dot">05</span><div><h4>Commit chat state</h4><p>Persist timestamp, direction, pointer, and cleanup result.</p></div></div>
+            </div>
+            <div class="failure-grid">
+              <div class="failure rollback"><b>Pointer update fails</b><p>Delete the replacement and retain the old canonical note. Resume from the ledger.</p></div>
+              <div class="failure retry"><b>Old-note cleanup fails</b><p>Keep the new pointer canonical and save cleanup_pending for a later retry.</p></div>
+              <div class="failure safe"><b>Delayed event arrives</b><p>Transcript can be rebuilt, but event-time guards preserve newer CRM activity state.</p></div>
+            </div>
+          </article>
+        </section>
+
+        <section class="section" id="schedule">
+          <div class="section-head"><div><p class="eyebrow">Two discovery horizons</p><h2>Same processor, different search windows</h2><p>The weekly sweep broadens discovery; it does not introduce alternate matching or mutation rules.</p></div><span class="section-tag">Asia/Tbilisi display</span></div>
+          <div class="schedule-grid">
+            <article class="schedule-card featured"><div class="schedule-top"><div><h3>Nightly overlap</h3><p class="cron">0 3 * * 1–6</p></div><span class="schedule-window">26 hours</span></div><p class="schedule-copy">Find yesterday’s missed events with a two-hour overlap that absorbs a late or skipped webhook delivery.</p><ul class="schedule-list"><li><span>Runs</span><b>Monday–Saturday · 03:00</b></li><li><span>Primary job</span><b>Continuous repair</b></li><li><span>Expected volume</span><b>Hundreds of events</b></li><li><span>Recovery scan</span><b>Failed + stale rows</b></li></ul></article>
+            <article class="schedule-card"><div class="schedule-top"><div><h3>Weekly sweep</h3><p class="cron">0 4 * * 0</p></div><span class="schedule-window">92 days</span></div><p class="schedule-copy">Revisit the long tail: chats that were missed, became matchable later, or need a checkpointed saga resumed.</p><ul class="schedule-list"><li><span>Runs</span><b>Sunday · 04:00</b></li><li><span>Primary job</span><b>Historical completeness</b></li><li><span>Expected volume</span><b>Thousands of events</b></li><li><span>Recovery scan</span><b>Failed + stale rows</b></li></ul></article>
+          </div>
+          <div class="guard-card"><b>Why overlap cannot corrupt “last interaction”</b><p>Each event is keyed by account + message, and the chat/company state stores the newest committed event timestamp. Replays and out-of-order messages may repair missing side effects, but they cannot move the interaction date or direction backward.</p></div>
+        </section>
+
+        <section class="section" id="history">
+          <div class="section-head"><div><p class="eyebrow">Operational trace</p><h2>Recent reconciler runs</h2><p>Illustrative run history for the mockup. Every outcome remains inspectable through event and case ledgers.</p></div><span class="section-tag">Newest first</span></div>
+          <article class="card history-list">
+            <div class="history-row header"><span>Run</span><span>Completion</span><span>Events</span><span>Repairs</span><span>Outcome</span></div>
+            <div class="history-row"><span class="run-id">RUN-N-0827<span>27 Aug · 03:00</span></span><span><span class="bar"><i style="width:100%"></i></span></span><span>762 checked</span><span>9 repaired</span><span class="status completed">complete</span></div>
+            <div class="history-row"><span class="run-id">RUN-N-0826<span>26 Aug · 03:00</span></span><span><span class="bar"><i style="width:99.7%;background:var(--amber)"></i></span></span><span>811 checked</span><span>11 repaired</span><span class="status waiting">2 review</span></div>
+            <div class="history-row"><span class="run-id">RUN-N-0825<span>25 Aug · 03:00</span></span><span><span class="bar"><i style="width:100%"></i></span></span><span>694 checked</span><span>4 repaired</span><span class="status completed">complete</span></div>
+            <div class="history-row"><span class="run-id">RUN-W-0823<span>23 Aug · 04:00</span></span><span><span class="bar"><i style="width:99.9%;background:var(--amber)"></i></span></span><span>8,776 checked</span><span>37 repaired</span><span class="status waiting">5 review</span></div>
+            <div class="history-row"><span class="run-id">RUN-N-0822<span>22 Aug · 03:00</span></span><span><span class="bar"><i style="width:99.4%;background:var(--red)"></i></span></span><span>731 checked</span><span>6 repaired</span><span class="status failed">1 failed</span></div>
+            <div class="history-row"><span class="run-id">RUN-N-0821<span>21 Aug · 03:00</span></span><span><span class="bar"><i style="width:100%"></i></span></span><span>708 checked</span><span>8 repaired</span><span class="status completed">complete</span></div>
+          </article>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div class="scrim" id="scrim"></div>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-labelledby="drawer-title" inert>
+    <button class="drawer-close" id="drawer-close" type="button" aria-label="Close stage details">×</button>
+    <p class="drawer-kicker" id="drawer-kicker">Stage 01 · trigger</p>
+    <h2 id="drawer-title">Choose run window</h2>
+    <p class="drawer-summary" id="drawer-summary"></p>
+    <div class="drawer-block"><h3>Input → output</h3><div class="io-grid"><div class="io-card"><span>Input</span><code id="drawer-input"></code></div><div class="io-card"><span>Output</span><code id="drawer-output"></code></div></div></div>
+    <div class="drawer-block"><h3>Safeguards and behavior</h3><ul id="drawer-rules"></ul></div>
+    <div class="drawer-note" id="drawer-note"></div>
+  </aside>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const modes = {
+      nightly: { cron: '0 3 * * 1–6', title: 'Mon–Sat · 03:00', description: 'Rolling 26-hour overlap · all allowed accounts', window: '26h', chats: '318', events: '762', repaired: '9', duration: '04:39', rejected: '14', identity: '97.8%', attachments: '11', process: '9', reviews: '2', resumed: '3' },
+      weekly: { cron: '0 4 * * 0', title: 'Sunday · 04:00', description: 'Rolling 92-day sweep · all allowed accounts', window: '92d', chats: '2,944', events: '8,776', repaired: '37', duration: '31:12', rejected: '186', identity: '96.9%', attachments: '124', process: '37', reviews: '5', resumed: '12' }
+    };
+
+    const scenarios = {
+      normal: { process: null, repaired: null, reviews: null, resumed: null, failed: '0', history: ['done', 'Load full chat history'], ledger: ['done', 'Coalesce delivery rows'], resolver: ['done', 'Run shared resolver'], mutation: ['done', 'Resume mutation saga'], recovery: ['done', 'Retry incomplete ledgers'], complete: ['done', 'Commit observable state'], toast: 'Routine overlap: completed events are coalesced; new and incomplete events continue.' },
+      missed: { process: '18', repaired: '18', reviews: '3', resumed: '3', failed: '0', history: ['done', 'Load full chat history'], ledger: ['warn', '18 missed webhook events'], resolver: ['done', 'Resolve recovered identities'], mutation: ['done', 'Apply missing side effects'], recovery: ['done', 'Retry incomplete ledgers'], complete: ['done', 'Commit 18 repairs'], toast: 'Missed deliveries found: events absent from the ledger enter the shared processor.' },
+      stale: { process: '9', repaired: '7', reviews: '2', resumed: '11', failed: '1', history: ['done', 'Load full chat history'], ledger: ['warn', 'Stale processing rows found'], resolver: ['done', 'Revalidate current identity'], mutation: ['fail', 'One Attio retry remains'], recovery: ['warn', 'Resume 11 checkpoints'], complete: ['warn', 'Commit recoverable outcome'], toast: 'Stale saga: completed steps are retained and recovery resumes at the next safe checkpoint.' },
+      truncated: { process: '6', repaired: '5', reviews: '1', resumed: '3', failed: '1', history: ['warn', 'History capped at 10,000'], ledger: ['done', 'Coalesce loaded events'], resolver: ['done', 'Resolve bounded events'], mutation: ['warn', 'Commit partial history label'], recovery: ['done', 'Retry incomplete ledgers'], complete: ['warn', 'Alert history truncation'], toast: '10,000-message cap reached: loaded events continue, while truncation is recorded and alerted.' }
+    };
+
+    const nodeDetails = {
+      trigger: { kicker: 'Stage 01 · schedule', title: 'Choose run window', summary: 'The two triggers set discovery horizon metadata before joining a single reconciliation path.', input: 'schedule firing + current timestamp', output: '{ mode, since, until, account_allowlist }', rules: ['Nightly runs Monday–Saturday at 03:00 with a rolling 26-hour horizon.', 'Weekly runs Sunday at 04:00 with a rolling 92-day horizon.', 'Both modes invoke identical downstream identity and company logic.'], note: 'The wider weekly window changes what is discovered—not how any event is matched or mutated.' },
+      accounts: { kicker: 'Stage 02 · scope', title: 'Load the account allowlist', summary: 'Discovery is bounded to the configured production LinkedIn mailboxes.', input: '{ mode, since, until }', output: '3 allowed Unipile account IDs', rules: ['An event outside the allowlist is rejected before CRM processing.', 'Account ID remains part of every event, case, and chat-state key.', 'No secret or credential value belongs in exported workflow data.'], note: 'Including account ID in durable keys prevents message or chat identifier collisions between mailboxes.' },
+      chats: { kicker: 'Stage 03 · Unipile', title: 'Paginate the chat index', summary: 'Each account is scanned with cursors until the discovery window is exhausted.', input: 'account_id + since/until + cursor', output: 'bounded chat candidates', rules: ['Continue from each returned cursor rather than relying on one page.', 'Do not assume the first page covers the window.', 'Preserve source chat IDs for history and case-ledger keys.'], note: 'The chat scan finds candidates; message history remains authoritative for individual event order.' },
+      filter: { kicker: 'Stage 04 · eligibility', title: 'Keep only one-to-one threads', summary: 'Groups and unusable counterpart records never enter the shared processor.', input: 'paginated Unipile chats', output: 'eligible 1:1 chats', rules: ['Require thread type 0 / one-to-one.', 'Require an allowed account.', 'Keep identity evidence even when URN is absent.', 'Rejecting a group chat is a successful ignored outcome, not a failed saga.'], note: 'The reconciler preserves the production account allowlist and 1:1 restriction.' },
+      identity: { kicker: 'Stage 05 · evidence', title: 'Attach counterpart identity', summary: 'The event retains all source evidence needed by the shared identity ladder.', input: 'chat + attendee list', output: '{ provider_id, profile_url, name, headline }', rules: ['Do not require a URN to begin matching.', 'Canonical public LinkedIn URL is independent match evidence.', 'Normalize names for comparison while retaining original display text.', 'Headline and occupation support review but do not authorize a merge.'], note: 'DeepSeek receives only bounded Attio candidates later; it never searches or approves a merge.' },
+      history: { kicker: 'Stage 06 · history', title: 'Load complete chat history', summary: 'History pages are deduplicated and ordered before events or transcripts are derived.', input: 'account_id + chat_id + cursor', output: '≤ 10,000 unique chronological messages', rules: ['Paginate using Unipile cursors.', 'Deduplicate by message ID across overlapping pages.', 'Sort chronologically before deriving direction or transcript.', 'At 10,000 messages, mark truncated and send an alert.'], note: 'Attachment-only messages become [Attachment: type] or [Attachment] and still affect interaction state.' },
+      envelope: { kicker: 'Stage 07 · normalization', title: 'Expand normalized events', summary: 'Every unique source message becomes the same envelope consumed by the live processor.', input: 'chronological messages + counterpart evidence', output: 'event envelopes keyed by account_id:message_id', rules: ['Retain account, chat, message, timestamp, direction, and text.', 'Use an attachment label when message text is empty.', 'Retain a non-secret reference to the original payload.', 'Do not infer mutable CRM fields during normalization.'], note: 'Normalization is source-preserving. Identity and company decisions happen only in shared workflows.' },
+      ledger: { kicker: 'Stage 08 · idempotency', title: 'Coalesce in the event ledger', summary: 'The durable row decides whether the event is complete, active, resumable, or waiting for review.', input: 'normalized event + existing ledger rows', output: 'ignore | process | resume | waiting_review', rules: ['Only completed events are ignored.', 'Duplicate rows are coalesced before processing.', 'Stale processing and failed rows resume from committed steps.', 'Attempts, outputs, and errors remain durable.'], note: 'This is the key change from workflow static data: a redelivery after partial failure is recoverable.' },
+      resolver: { kicker: 'Stage 09 · shared resolver', title: 'Resolve person and company', summary: 'The scheduled path calls the same bounded matching ladder as live delivery.', input: 'counterpart evidence + bounded Attio candidates', output: 'matched | identity_review | qualification | unmatched', rules: ['Exact URN, then exact canonical URL, then unique normalized full name.', 'Partial names and conflicts always require Slack approval.', 'Safe matches backfill missing identity immediately.', 'Linked company and Cold Calling membership are revalidated.'], note: 'Ambiguity is resolved before any “needs sync” check so the complete candidate set is evaluated.' },
+      mutation: { kicker: 'Stage 10 · shared saga', title: 'Resume the Attio mutation saga', summary: 'All Attio side effects pass through one workflow with explicit checkpoints and guarded writes.', input: 'resolved event + ledger checkpoints', output: 'completed steps + outputs + retryable error', rules: ['Never overwrite a conflicting URN or profile URL automatically.', 'Reuse company by exact domain, then unique normalized name.', 'Guard interaction date and direction with newest committed event time.', 'Replace transcripts using a pointer commit and cleanup retry.'], note: 'There is no cross-service transaction. The durable saga makes observable state idempotent and recoverable.' },
+      recovery: { kicker: 'Stage 11 · recovery scan', title: 'Retry failed and stale events', summary: 'Recovery is not dependent on rediscovering a chat message in the active time window.', input: 'failed + stale event-ledger query', output: 'incomplete envelopes resumed through shared processor', rules: ['Query failed rows and stale processing rows after discovery.', 'Recover the original normalized envelope and checkpoint list.', 'Revalidate current Attio state before every resumed mutation.', 'Pending old-note cleanup can retry without rebuilding the transcript.'], note: 'A weekly run broadens discovery, but both nightly and weekly runs repair ledger rows outside that horizon.' },
+      complete: { kicker: 'Stage 12 · observable outcome', title: 'Commit run outcomes', summary: 'Each event finishes as completed, waiting review, or failed with enough detail to continue.', input: 'processor result + truncation flag', output: 'ledger status + Slack alert when required', rules: ['Completed rows are safe to ignore on later overlap.', 'Waiting review retains one idempotent Slack parent case.', 'Failed rows preserve last committed step and error.', 'History truncation is explicitly alerted and never labeled complete.'], note: 'Run-level success can include waiting-review events; those cases remain visible and resumable after a human decision.' }
+    };
+
+    let activeMode = 'nightly';
+    let activeScenario = 'normal';
+    let previewTimer = null;
+    const $ = (selector) => document.querySelector(selector);
+    const $$ = (selector) => [...document.querySelectorAll(selector)];
+
+    function setText(id, value) { const el = document.getElementById(id); if (el) el.textContent = value; }
+
+    function applyMode(mode) {
+      activeMode = mode;
+      const data = modes[mode];
+      $$('[data-mode]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.mode === mode)));
+      setText('mode-cron', data.cron); setText('mode-title', data.title); setText('mode-description', data.description);
+      setText('metric-chats', data.chats); setText('metric-events', data.events); setText('metric-repaired', data.repaired); setText('metric-duration', data.duration);
+      setText('node-window', data.window); setText('node-chats', data.chats); setText('node-rejected', data.rejected); setText('node-identity', data.identity);
+      setText('node-events', data.events); setText('node-attachments', data.attachments);
+      setText('run-label', mode === 'nightly' ? 'Nightly run completed' : 'Weekly sweep completed');
+      setText('run-subtitle', mode === 'nightly' ? '27 Aug 2026 · 03:00:04–03:04:43' : '23 Aug 2026 · 04:00:06–04:31:18');
+      applyScenario(activeScenario, false);
+    }
+
+    function statusClass(id, tuple) {
+      const el = document.getElementById(id);
+      el.className = 'node-status' + (tuple[0] === 'done' ? '' : ' ' + tuple[0]);
+      el.textContent = tuple[0] === 'done' ? 'done' : tuple[0] === 'fail' ? 'failed' : tuple[0] === 'wait' ? 'review' : 'warning';
+      const node = el.closest('.flow-node');
+      if (node) node.querySelector('h3').textContent = tuple[1];
+    }
+
+    function applyScenario(scenario, announce = true) {
+      activeScenario = scenario;
+      const config = scenarios[scenario];
+      const base = modes[activeMode];
+      $$('.scenario').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.scenario === scenario)));
+      setText('node-process', config.process || base.process); setText('node-repaired', config.repaired || base.repaired); setText('node-reviews', config.reviews || base.reviews); setText('node-resumed', config.resumed || base.resumed); setText('node-failed', config.failed);
+      setText('metric-repaired', config.repaired || base.repaired);
+      statusClass('history-status', config.history); statusClass('ledger-status', config.ledger); statusClass('resolver-status', config.resolver); statusClass('mutation-status', config.mutation); statusClass('recovery-status', config.recovery); statusClass('complete-status', config.complete);
+      if (announce) toast(config.toast);
+    }
+
+    function openDrawer(key) {
+      const detail = nodeDetails[key];
+      if (!detail) return;
+      setText('drawer-kicker', detail.kicker); setText('drawer-title', detail.title); setText('drawer-summary', detail.summary); setText('drawer-input', detail.input); setText('drawer-output', detail.output); setText('drawer-note', detail.note);
+      $('#drawer-rules').innerHTML = detail.rules.map((rule) => `<li>${rule}</li>`).join('');
+      $('#drawer').classList.add('open'); $('#scrim').classList.add('open'); $('#drawer').setAttribute('aria-hidden', 'false'); $('#drawer').inert = false; $('#drawer-close').focus();
+    }
+
+    function closeDrawer() { $('#drawer').classList.remove('open'); $('#scrim').classList.remove('open'); $('#drawer').setAttribute('aria-hidden', 'true'); $('#drawer').inert = true; }
+    function toast(message) { const el = $('#toast'); el.innerHTML = `<b>${activeMode === 'nightly' ? 'Nightly' : 'Weekly'} preview</b> · ${message}`; el.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove('show'), 3300); }
+
+    function playPreview() {
+      clearInterval(previewTimer);
+      const board = $('#flow-board'); const nodes = $$('.flow-node'); let index = 0;
+      board.classList.add('running'); nodes.forEach((node) => node.classList.remove('run-active'));
+      $('#preview-run').disabled = true; $('#preview-run').textContent = 'Tracing shared saga…';
+      const advance = () => {
+        nodes.forEach((node) => node.classList.remove('run-active'));
+        if (index >= nodes.length) { clearInterval(previewTimer); board.classList.remove('running'); $('#preview-run').disabled = false; $('#preview-run').textContent = 'Play annotated run preview'; toast('Run trace complete. Every mutation passed through the durable processor.'); return; }
+        nodes[index].classList.add('run-active'); index += 1;
+      };
+      advance(); previewTimer = setInterval(advance, 300);
+    }
+
+    $$('[data-mode]').forEach((button) => button.addEventListener('click', () => applyMode(button.dataset.mode)));
+    $$('.scenario').forEach((button) => button.addEventListener('click', () => applyScenario(button.dataset.scenario)));
+    $$('.flow-node').forEach((node) => node.addEventListener('click', () => openDrawer(node.dataset.node)));
+    $$('[data-node-open]').forEach((button) => button.addEventListener('click', () => openDrawer(button.dataset.nodeOpen)));
+    $$('.filter').forEach((button) => button.addEventListener('click', () => {
+      const filter = button.dataset.filter;
+      $$('.filter').forEach((item) => item.setAttribute('aria-pressed', String(item === button)));
+      $$('#ledger-rows tr').forEach((row) => { row.hidden = filter !== 'all' && row.dataset.status !== filter; });
+    }));
+    $('#preview-run').addEventListener('click', playPreview); $('#drawer-close').addEventListener('click', closeDrawer); $('#scrim').addEventListener('click', closeDrawer);
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeDrawer(); });
+
+    const sections = $$('main section[id]'); const navLinks = $$('.rail-nav a');
+    const observer = new IntersectionObserver((entries) => {
+      const visible = entries.filter((entry) => entry.isIntersecting).sort((a,b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!visible) return;
+      navLinks.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === '#' + visible.target.id));
+    }, { rootMargin: '-20% 0px -68% 0px', threshold: [0, .2, .6] });
+    sections.forEach((section) => observer.observe(section));
+
+    applyMode('nightly');
+  </script>
+</body>
+</html>

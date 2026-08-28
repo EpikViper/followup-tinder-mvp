@@ -3,59 +3,633 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>LinkedIn → Attio workflow</title>
+  <meta name="color-scheme" content="light" />
+  <title>Unipile to Attio - current sync logic</title>
   <style>
-    :root { --ink:#14213d; --muted:#64748b; --line:#cbd5e1; --blue:#2563eb; --green:#059669; --amber:#d97706; --rose:#e11d48; --panel:#fff; }
-    * { box-sizing:border-box } body { margin:0; background:#f1f5f9; color:var(--ink); font:14px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; overflow:hidden; }
-    header { height:76px; display:flex; align-items:center; justify-content:space-between; padding:14px 24px; background:#fff; border-bottom:1px solid #e2e8f0; position:relative; z-index:3; }
-    h1 { font-size:18px; margin:0 0 3px; letter-spacing:-.02em } .sub { color:var(--muted); font-size:12px } .status { display:flex; align-items:center; gap:8px; border:1px solid #bbf7d0; background:#f0fdf4; color:#166534; padding:7px 10px; border-radius:999px; font-weight:650; font-size:12px } .dot { width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 3px #dcfce7 }
-    .toolbar { position:fixed; right:20px; bottom:20px; z-index:4; display:flex; gap:7px; padding:7px; border:1px solid #dbe3ee; border-radius:12px; background:rgba(255,255,255,.94); box-shadow:0 10px 28px rgba(15,23,42,.12); backdrop-filter:blur(8px) } button { border:0; background:#f8fafc; border-radius:8px; color:#334155; cursor:pointer; width:32px;height:32px;font:600 18px/1 system-ui } button:hover { background:#e2e8f0 } #zoom { min-width:46px; width:auto; font-size:12px; cursor:default }
-    #viewport { height:calc(100vh - 76px); overflow:hidden; cursor:grab; background-image:radial-gradient(#cbd5e1 1px, transparent 1px); background-size:20px 20px; } #viewport.dragging { cursor:grabbing } #board { width:1650px; height:970px; transform-origin:0 0; position:relative; margin:0; }
-    .lane { position:absolute; left:70px; width:1500px; border-radius:18px; border:1px solid; padding:14px 18px; font-size:11px; letter-spacing:.1em; font-weight:800; color:#475569; } .lane.in { top:68px;height:180px;background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8 }.lane.match { top:272px;height:285px;background:#ecfdf5;border-color:#bbf7d0;color:#047857}.lane.write { top:580px;height:300px;background:#fff7ed;border-color:#fed7aa;color:#c2410c}
-    .node { position:absolute; z-index:2; width:170px; min-height:70px; padding:11px 12px; border:1px solid #d7e0eb; border-radius:12px; background:var(--panel); box-shadow:0 3px 9px rgba(15,23,42,.06); user-select:none } .node:hover { border-color:#93c5fd; box-shadow:0 10px 18px rgba(37,99,235,.12) } .node .tag { color:#64748b; font-size:10px; text-transform:uppercase; letter-spacing:.06em; font-weight:750; margin-bottom:5px }.node .title { font-weight:720; line-height:1.2 }.node .detail { color:#64748b; font-size:11px; margin-top:5px; line-height:1.3 }.node.attio { border-left:4px solid #2563eb }.node.unipile { border-left:4px solid #8b5cf6 }.node.slack { border-left:4px solid #db2777 }.node.logic { border-left:4px solid #059669 }.node.end { border-left:4px solid #94a3b8; background:#f8fafc }
-    .decision { position:absolute; z-index:2; width:112px;height:112px; transform:rotate(45deg); border:1px solid #facc15; background:#fffbeb; border-radius:12px; box-shadow:0 3px 9px rgba(15,23,42,.05) }.decision span { position:absolute; width:90px; left:11px; top:38px; transform:rotate(-45deg); font-weight:750; text-align:center; line-height:1.2; font-size:12px }.branch { position:absolute; z-index:3; color:#64748b; font-size:11px; font-weight:750; padding:3px 6px; border-radius:5px; background:#f8fafc }.branch.yes { color:#047857 }.branch.no { color:#be123c }
-    svg { position:absolute; inset:0; z-index:1; overflow:visible } path { fill:none; stroke:#94a3b8; stroke-width:2; marker-end:url(#arrow) } path.dashed { stroke-dasharray:5 5 } .caption { position:absolute; z-index:2; padding:7px 10px; border-radius:8px; background:#fff; color:#64748b; font-size:11px; border:1px dashed #cbd5e1; max-width:220px }
-    @media (max-width:700px) { header{padding:12px 16px}.status{display:none} }
+    :root {
+      --ink: #162033;
+      --muted: #667085;
+      --soft: #98a2b3;
+      --line: #dfe4ea;
+      --line-strong: #c9d1db;
+      --paper: #ffffff;
+      --canvas: #f4f6f8;
+      --navy: #17233b;
+      --blue: #2563eb;
+      --blue-soft: #eff6ff;
+      --violet: #7357d8;
+      --violet-soft: #f4f1ff;
+      --green: #137a57;
+      --green-soft: #ecfdf3;
+      --amber: #b65d0a;
+      --amber-soft: #fff7e8;
+      --red: #c4323d;
+      --red-soft: #fff1f2;
+      --shadow: 0 12px 40px rgba(26, 39, 64, .08);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button { font: inherit; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      min-height: 72px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 14px 28px;
+      color: white;
+      background: var(--navy);
+      border-bottom: 1px solid rgba(255,255,255,.12);
+    }
+    .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
+    .brand-mark {
+      width: 36px;
+      height: 36px;
+      display: grid;
+      place-items: center;
+      flex: 0 0 auto;
+      border: 1px solid rgba(255,255,255,.22);
+      border-radius: 10px;
+      background: rgba(255,255,255,.07);
+      font-weight: 800;
+      letter-spacing: -.06em;
+    }
+    .brand h1 { margin: 0; font-size: 16px; line-height: 1.25; letter-spacing: -.01em; }
+    .brand p { margin: 2px 0 0; color: #b9c3d4; font-size: 12px; }
+    .snapshot { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+    .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 0 4px rgba(74,222,128,.14); }
+    .snapshot-copy { color: #d7deea; font-size: 12px; text-align: right; }
+    .snapshot-copy strong { display: block; color: white; font-size: 12px; }
+
+    .shell { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: calc(100vh - 72px); }
+    .sidebar {
+      position: sticky;
+      top: 72px;
+      align-self: start;
+      height: calc(100vh - 72px);
+      padding: 24px 18px;
+      background: var(--paper);
+      border-right: 1px solid var(--line);
+      overflow: auto;
+    }
+    .eyebrow { margin: 0 0 9px; color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .sidebar-intro { margin: 0 4px 22px; color: var(--muted); font-size: 12px; }
+    .tablist { display: grid; gap: 7px; }
+    .tab {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 28px 1fr auto;
+      align-items: center;
+      gap: 9px;
+      padding: 11px 10px;
+      color: #475467;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      text-align: left;
+      cursor: pointer;
+    }
+    .tab:hover { background: #f8fafc; border-color: var(--line); }
+    .tab[aria-selected="true"] { color: var(--ink); background: #f0f4ff; border-color: #cddafd; box-shadow: inset 3px 0 0 var(--blue); }
+    .tab-icon { width: 25px; height: 25px; display: grid; place-items: center; border-radius: 7px; background: white; border: 1px solid var(--line); font-size: 11px; font-weight: 800; }
+    .tab-title { display: block; font-size: 13px; font-weight: 720; }
+    .tab-meta { display: block; color: var(--muted); font-size: 10px; margin-top: 1px; }
+    .tab-count { color: var(--soft); font: 700 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .sidebar-foot {
+      margin-top: 24px;
+      padding: 13px;
+      border: 1px solid #fed7aa;
+      border-radius: 11px;
+      background: #fffaf2;
+      color: #8a4b13;
+      font-size: 11px;
+    }
+    .sidebar-foot strong { display: block; margin-bottom: 4px; color: #7c3f0a; }
+
+    .main { min-width: 0; padding: 30px clamp(22px, 3vw, 46px) 60px; }
+    .panel { display: none; max-width: 1180px; margin: 0 auto; }
+    .panel.active { display: block; animation: enter .18s ease-out; }
+    @keyframes enter { from { opacity: .5; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+    .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 28px; margin-bottom: 22px; }
+    .page-head h2 { margin: 0; font-size: clamp(24px, 3vw, 34px); line-height: 1.14; letter-spacing: -.035em; }
+    .page-head p { max-width: 760px; margin: 9px 0 0; color: var(--muted); font-size: 14px; }
+    .mode-badge { flex: 0 0 auto; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; color: #475467; background: white; font-size: 11px; font-weight: 750; white-space: nowrap; }
+    .summary-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 22px; }
+    .metric { padding: 13px 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--paper); }
+    .metric span { display: block; color: var(--muted); font-size: 10px; font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
+    .metric strong { display: block; margin-top: 4px; font-size: 14px; }
+
+    .notice {
+      display: flex;
+      gap: 11px;
+      margin: 0 0 20px;
+      padding: 13px 15px;
+      border: 1px solid #f4c68f;
+      border-radius: 12px;
+      color: #7a4313;
+      background: var(--amber-soft);
+    }
+    .notice-mark { font-weight: 900; }
+    .notice strong { display: block; color: #65380f; }
+    .notice p { margin: 2px 0 0; font-size: 12px; }
+
+    .flow { position: relative; display: grid; gap: 12px; }
+    .step {
+      position: relative;
+      display: grid;
+      grid-template-columns: 54px minmax(0, 1fr);
+      min-width: 0;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 2px 5px rgba(26,39,64,.025);
+      overflow: visible;
+    }
+    .step:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      z-index: 4;
+      left: 26px;
+      bottom: -13px;
+      width: 2px;
+      height: 13px;
+      background: var(--line-strong);
+    }
+    .step-no { display: grid; place-items: center; color: #667085; background: #f8fafc; border-right: 1px solid var(--line); border-radius: 14px 0 0 14px; font: 800 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .step-body { min-width: 0; padding: 17px 18px 18px; }
+    .step-titleline { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+    .step h3 { margin: 0; font-size: 15px; letter-spacing: -.01em; }
+    .system-pill { flex: 0 0 auto; padding: 4px 7px; border-radius: 999px; color: var(--muted); background: #f7f8fa; border: 1px solid var(--line); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+    .step-lead { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+    .rule-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 14px; }
+    .rule { min-width: 0; padding: 11px 12px; border-radius: 9px; background: #f8fafc; border: 1px solid #e8ecf1; }
+    .rule b { display: block; margin-bottom: 3px; font-size: 11px; }
+    .rule span { display: block; color: var(--muted); font-size: 11px; }
+    .rule.good { background: var(--green-soft); border-color: #bce9d5; }
+    .rule.warn { background: var(--amber-soft); border-color: #f4c68f; }
+    .rule.stop { background: var(--red-soft); border-color: #fecdd3; }
+    .rule.info { background: var(--blue-soft); border-color: #c8dcff; }
+    .rule.violet { background: var(--violet-soft); border-color: #d9d0ff; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .96em; }
+
+    .decision-box { margin-top: 14px; padding: 13px; border: 1px dashed #b7c2d0; border-radius: 10px; background: #fbfcfd; }
+    .decision-box > b { display: block; margin-bottom: 9px; font-size: 11px; letter-spacing: .02em; }
+    .branches { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .branch { padding: 10px 11px; border-left: 3px solid; border-radius: 7px; background: white; box-shadow: 0 1px 2px rgba(15,23,42,.04); font-size: 11px; }
+    .branch strong { display: block; margin-bottom: 2px; }
+    .branch.go { border-color: var(--green); }
+    .branch.halt { border-color: var(--red); }
+    .branch.wait { border-color: var(--amber); }
+    .branch.note { border-color: var(--blue); }
+
+    .write-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+    .write-card { padding: 13px; border: 1px solid var(--line); border-radius: 10px; background: #fbfcfd; }
+    .write-card h4 { margin: 0 0 6px; font-size: 12px; }
+    .write-card p { margin: 0; color: var(--muted); font-size: 11px; }
+    .write-card .target { margin-top: 8px; color: #344054; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+
+    .table-card { overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: white; box-shadow: var(--shadow); }
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 13px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); background: #f8fafc; font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
+    td { font-size: 12px; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { width: 18%; font-weight: 750; color: #344054; }
+    .status-tag { display: inline-block; margin-top: 6px; padding: 3px 6px; border-radius: 5px; font-size: 9px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+    .status-tag.risk { color: #9f2430; background: var(--red-soft); }
+    .status-tag.partial { color: #8a4b13; background: var(--amber-soft); }
+    .status-tag.safe { color: #126044; background: var(--green-soft); }
+
+    .ladder { display: grid; gap: 0; margin-top: 18px; }
+    .rung { position: relative; display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 72px; padding: 12px 14px; border: 1px solid var(--line); background: white; }
+    .rung + .rung { border-top: 0; }
+    .rung:first-child { border-radius: 13px 13px 0 0; }
+    .rung:last-child { border-radius: 0 0 13px 13px; }
+    .rung-num { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; color: var(--blue); background: var(--blue-soft); font: 800 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .rung h3 { margin: 0 0 2px; font-size: 13px; }
+    .rung p { margin: 0; color: var(--muted); font-size: 11px; }
+    .rung-result { max-width: 250px; color: #475467; font-size: 10px; text-align: right; }
+
+    .risk-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+    .risk-card { position: relative; padding: 17px 17px 16px 48px; border: 1px solid #f2b9be; border-radius: 13px; background: white; }
+    .risk-index { position: absolute; left: 15px; top: 16px; width: 23px; height: 23px; display: grid; place-items: center; border-radius: 7px; color: white; background: var(--red); font: 800 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .risk-card h3 { margin: 0 0 5px; font-size: 13px; }
+    .risk-card p { margin: 0; color: var(--muted); font-size: 11px; }
+    .risk-card .effect { margin-top: 9px; padding-top: 8px; border-top: 1px solid #f2e0e2; color: #8d2832; font-size: 10px; font-weight: 700; }
+
+    .footnote { margin-top: 18px; color: var(--muted); font-size: 10px; }
+    .print-note { display: none; }
+
+    @media (max-width: 980px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { position: sticky; top: 72px; z-index: 20; width: 100%; height: auto; padding: 10px 16px; border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+      .sidebar .eyebrow, .sidebar-intro, .sidebar-foot { display: none; }
+      .tablist { display: flex; width: max-content; }
+      .tab { width: auto; min-width: 150px; grid-template-columns: 25px 1fr; }
+      .tab-count { display: none; }
+      .main { padding-top: 23px; }
+      .summary-strip { grid-template-columns: repeat(2, 1fr); }
+      .rule-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 680px) {
+      .topbar { padding: 12px 16px; }
+      .snapshot-copy { display: none; }
+      .main { padding: 20px 14px 44px; }
+      .page-head { display: block; }
+      .mode-badge { display: inline-block; margin-top: 12px; }
+      .summary-strip, .rule-grid, .branches, .write-grid, .risk-grid { grid-template-columns: 1fr; }
+      .step { grid-template-columns: 42px minmax(0, 1fr); }
+      .step:not(:last-child)::after { left: 20px; }
+      .step-body { padding: 15px 13px; }
+      .step-titleline { align-items: flex-start; }
+      .rung { grid-template-columns: 36px 1fr; }
+      .rung-result { grid-column: 2; max-width: none; text-align: left; }
+    }
+    @media print {
+      .topbar { position: static; }
+      .shell { display: block; }
+      .sidebar { display: none; }
+      .main { padding: 20px; }
+      .panel { display: block !important; page-break-before: always; }
+      .panel:first-child { page-break-before: auto; }
+      .print-note { display: block; }
+      .step, .table-card, .risk-card { break-inside: avoid; box-shadow: none; }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <div><h1>LinkedIn (Unipile) → Attio outbound pipeline</h1><div class="sub">Live n8n workflow · 42 nodes · simplified operational map</div></div>
-    <div class="status"><span class="dot"></span>Workflow active</div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">S.</div>
+      <div>
+        <h1>Unipile &rarr; Attio: current-state map</h1>
+        <p>Decision logic only. Transport and JSON-shaping nodes are intentionally hidden.</p>
+      </div>
+    </div>
+    <div class="snapshot" title="Both workflows were read from the active n8n instance">
+      <span class="live-dot" aria-hidden="true"></span>
+      <div class="snapshot-copy"><strong>Active production snapshot</strong>Checked 27 Aug 2026</div>
+    </div>
   </header>
-  <main id="viewport" aria-label="Workflow diagram"><div id="board">
-    <div class="lane in">INBOUND EVENT</div><div class="lane match">MATCH &amp; ENRICH</div><div class="lane write">WRITE, NOTES &amp; NOTIFICATIONS</div>
-    <svg width="1650" height="970" aria-hidden="true"><defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#94a3b8"/></marker></defs>
-      <path d="M285 170 H338"/><path d="M510 170 H575"/><path d="M715 170 H800"/><path d="M885 205 V365 H205"/>
-      <path d="M375 400 H425"/><path d="M595 400 H660"/><path d="M800 400 H875"/><path d="M1050 400 H1110"/>
-      <path d="M1195 435 V630 H210"/><path d="M380 665 H440"/><path d="M610 665 H680"/><path d="M850 665 H930"/><path d="M1075 665 H1140"/>
-      <path d="M655 455 V515 H965" class="dashed"/><path d="M1125 455 V515 H965" class="dashed"/><path d="M980 705 V795 H865" class="dashed"/>
-    </svg>
-    <article class="node unipile" style="left:115px;top:135px"><div class="tag">Webhook</div><div class="title">LinkedIn message</div><div class="detail">Unipile POST event</div></article>
-    <article class="node logic" style="left:340px;top:135px"><div class="tag">Guard</div><div class="title">Parse &amp; deduplicate</div><div class="detail">Scope, 1:1 thread, direction</div></article>
-    <div class="decision" style="left:585px;top:115px"><span>Proceed?</span></div><span class="branch yes" style="left:742px;top:146px">YES</span><span class="branch no" style="left:622px;top:238px">NO → ignored</span>
-    <article class="node unipile" style="left:800px;top:135px"><div class="tag">Unipile</div><div class="title">Fetch thread tail</div><div class="detail">Find previous message &amp; context</div></article>
 
-    <article class="node attio" style="left:120px;top:365px"><div class="tag">Attio</div><div class="title">Find person</div><div class="detail">URN + name variants</div></article>
-    <article class="node attio" style="left:425px;top:365px"><div class="tag">Attio</div><div class="title">Attach companies</div><div class="detail">Resolve person’s company</div></article>
-    <div class="decision" style="left:665px;top:345px"><span>Person + company?</span></div><span class="branch yes" style="left:820px;top:375px">MATCHED</span><span class="branch no" style="left:693px;top:468px">NO MATCH</span>
-    <article class="node attio" style="left:875px;top:365px"><div class="tag">Attio</div><div class="title">Find pipeline entry</div><div class="detail">Cold Calling / outbound list</div></article>
-    <article class="node logic" style="left:1110px;top:365px"><div class="tag">Rules</div><div class="title">Decide writes</div><div class="detail">Stage, follow-up &amp; date logic</div></article>
-    <div class="caption" style="left:850px;top:500px">Unmatched route: distinguish a missing person, wait/recheck SendPilot when relevant, then Slack-alert or silently skip.</div>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Workflow views">
+      <p class="eyebrow">Views</p>
+      <p class="sidebar-intro">Read this from top to bottom as the system behaves today, not as it should behave.</p>
+      <div class="tablist" role="tablist" aria-label="Workflow views">
+        <button class="tab" id="tab-live" role="tab" aria-controls="live" aria-selected="true" data-target="live">
+          <span class="tab-icon">01</span><span><span class="tab-title">Live webhook</span><span class="tab-meta">Message-by-message</span></span><span class="tab-count">42</span>
+        </button>
+        <button class="tab" id="tab-nightly" role="tab" aria-controls="nightly" aria-selected="false" data-target="nightly">
+          <span class="tab-icon">02</span><span><span class="tab-title">Reconciler</span><span class="tab-meta">Nightly + weekly</span></span><span class="tab-count">44</span>
+        </button>
+        <button class="tab" id="tab-rules" role="tab" aria-controls="rules" aria-selected="false" data-target="rules">
+          <span class="tab-icon">03</span><span><span class="tab-title">Matching &amp; dedupe</span><span class="tab-meta">Exact rules</span></span><span class="tab-count">5</span>
+        </button>
+        <button class="tab" id="tab-risks" role="tab" aria-controls="risks" aria-selected="false" data-target="risks">
+          <span class="tab-icon">!</span><span><span class="tab-title">Breakpoints</span><span class="tab-meta">Where this can fail</span></span><span class="tab-count">9</span>
+        </button>
+      </div>
+      <div class="sidebar-foot"><strong>Important distinction</strong>The system does not merge duplicate Attio people. It either chooses one record, skips the write, or asks a human to fix the duplicates.</div>
+    </aside>
 
-    <article class="node attio" style="left:125px;top:630px"><div class="tag">Attio</div><div class="title">Cache LinkedIn URN</div><div class="detail">Persist CRM identity match</div></article>
-    <article class="node unipile" style="left:440px;top:630px"><div class="tag">Unipile</div><div class="title">Fetch full thread</div><div class="detail">Build latest transcript</div></article>
-    <article class="node attio" style="left:680px;top:630px"><div class="tag">Attio</div><div class="title">Create / replace note</div><div class="detail">Save note ID on the company</div></article>
-    <div class="decision" style="left:935px;top:610px"><span>Outbound?</span></div><span class="branch yes" style="left:1090px;top:640px">YES</span><span class="branch no" style="left:955px;top:756px">NO → reply alert</span>
-    <article class="node attio" style="left:1140px;top:630px"><div class="tag">Attio</div><div class="title">Patch pipeline entry</div><div class="detail">Follow-up date/count when needed</div></article>
-    <article class="node slack" style="left:790px;top:770px"><div class="tag">Slack</div><div class="title">Alert + stage buttons</div><div class="detail">Unmatched / reply follow-up</div></article>
-  </div></main>
-  <div class="toolbar"><button id="out" title="Zoom out">−</button><button id="zoom">100%</button><button id="in" title="Zoom in">+</button><button id="reset" title="Reset view">⌖</button></div>
+    <main class="main">
+      <section class="panel active" id="live" role="tabpanel" aria-labelledby="tab-live">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Workflow 01 / event path</p>
+            <h2>One Unipile message arrives</h2>
+            <p>The live path filters the event, resolves one Attio person and their linked company, checks Outbound Pipeline membership, then updates identity, activity, transcript, counters, and alerts.</p>
+          </div>
+          <span class="mode-badge">Active &middot; 42 implementation nodes</span>
+        </div>
+
+        <div class="summary-strip">
+          <div class="metric"><span>Trigger</span><strong>Every message event</strong></div>
+          <div class="metric"><span>Identity priority</span><strong>URN, then exact name</strong></div>
+          <div class="metric"><span>Company source</span><strong>Person's linked company</strong></div>
+          <div class="metric"><span>Write gate</span><strong>Outbound Pipeline</strong></div>
+        </div>
+
+        <div class="notice">
+          <div class="notice-mark">!</div>
+          <div><strong>"Deduplicated" means the message ID was seen, not that the Attio contact was deduplicated.</strong><p>The live workflow records the ID in n8n static memory before any Attio write succeeds. That is an at-most-once gate, not a durable completed-write ledger.</p></div>
+        </div>
+
+        <div class="flow">
+          <article class="step">
+            <div class="step-no">01</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Admit or drop the event</h3><span class="system-pill">Unipile webhook</span></div>
+              <p class="step-lead">The event is allowed only if every guard below passes.</p>
+              <div class="rule-grid">
+                <div class="rule"><b>Event</b><span>Must be <span class="mono">message_received</span>.</span></div>
+                <div class="rule"><b>Network</b><span><span class="mono">account_type</span> must be LinkedIn.</span></div>
+                <div class="rule"><b>Mailbox</b><span>Only Sandro, Sergi, or Revaz account IDs.</span></div>
+                <div class="rule"><b>Conversation</b><span>Not a group; no more than 2 attendees.</span></div>
+                <div class="rule"><b>Body</b><span>Trimmed message text must not be empty.</span></div>
+                <div class="rule warn"><b>Delivery dedupe</b><span>Drop if <span class="mono">message_id</span> exists in the last 2,000 remembered IDs.</span></div>
+              </div>
+              <div class="decision-box">
+                <b>Direction and counterpart</b>
+                <div class="branches">
+                  <div class="branch go"><strong>Direction</strong>Use <span class="mono">is_sender</span>; otherwise compare sender provider ID with the mailbox's own LinkedIn ID.</div>
+                  <div class="branch halt"><strong>No counterpart URN</strong>Drop the event. No Attio lookup, note, date, or alert is written.</div>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-no">02</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Build the contact candidates</h3><span class="system-pill">Unipile + Attio</span></div>
+              <p class="step-lead">One Attio query uses an OR across a stable identifier and exact full-name variants.</p>
+              <div class="rule-grid">
+                <div class="rule violet"><b>Name variant A</b><span>Collapse repeated whitespace in the Unipile display name.</span></div>
+                <div class="rule violet"><b>Name variant B</b><span>Keep the raw name, including its original whitespace.</span></div>
+                <div class="rule violet"><b>Name variant C</b><span>Strip pictographs/symbols and trim non-alphanumeric edges.</span></div>
+              </div>
+              <div class="decision-box">
+                <b>Attio query: <span class="mono">linkedin_urn = counterpart URN OR name.full_name = any exact variant</span> &middot; limit 25</b>
+                <div class="branches">
+                  <div class="branch go"><strong>Exactly 1 URN result</strong>Choose it. Name results are ignored.</div>
+                  <div class="branch halt"><strong>2+ URN results</strong>Ambiguous duplicate records. Write nothing and prepare an inbound-only Slack alert.</div>
+                  <div class="branch note"><strong>0 URN + exactly 1 exact-name result</strong>Choose it, even without email, domain, employer, or profile URL corroboration.</div>
+                  <div class="branch halt"><strong>0 URN + 2+ exact-name results</strong>Ambiguous. The live path does not use pipeline membership to break the tie.</div>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-no">03</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Accept the person's company</h3><span class="system-pill">Attio relation</span></div>
+              <p class="step-lead">The chosen person's first linked <span class="mono">company</span> target becomes the company for the entire message and transcript.</p>
+              <div class="decision-box">
+                <div class="branches">
+                  <div class="branch go"><strong>Person + linked company</strong>Continue. The company gets <span class="mono">last_interaction_by</span> immediately.</div>
+                  <div class="branch halt"><strong>Person but no company</strong>No transcript, no URN cache, no pipeline update. Inbound alert once per 24 hours.</div>
+                  <div class="branch wait"><strong>No person + inbound</strong>Wait 15 minutes for SendPilot, then rerun the same Attio person query.</div>
+                  <div class="branch halt"><strong>No person + outbound</strong>The workflow checks whether the thread ever had an inbound message, but both outcomes are silent because the final alert gate only allows inbound events.</div>
+                </div>
+              </div>
+              <div class="rule-grid">
+                <div class="rule warn"><b>15-minute recheck finds a row</b><span>The run ends in "Silent Skip"; it does not re-enter matching or log this original message.</span></div>
+                <div class="rule stop"><b>15-minute recheck still empty</b><span>Inbound gets a Slack card with buttons to create the lead at a chosen stage.</span></div>
+                <div class="rule info"><b>Company identity</b><span>No company-name or domain matching occurs in this workflow.</span></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-no">04</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Require an Outbound Pipeline entry</h3><span class="system-pill">Attio list</span></div>
+              <p class="step-lead">The system fetches every entry attached to the company and takes the first whose list API slug is <span class="mono">cold_calling</span>.</p>
+              <div class="decision-box">
+                <div class="branches">
+                  <div class="branch go"><strong>Entry exists</strong>Fetch that entry and continue to CRM writes.</div>
+                  <div class="branch halt"><strong>No entry</strong>No URN cache, transcript, counter, or date update. Inbound gets a rate-limited Slack alert.</div>
+                </div>
+              </div>
+              <div class="rule-grid">
+                <div class="rule warn"><b>Partial write before this gate</b><span><span class="mono">last_interaction_by</span> was already patched on the company when person + company matched.</span></div>
+                <div class="rule"><b>Multiple matching entries</b><span>The first <span class="mono">cold_calling</span> entry returned by Attio wins.</span></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-no">05</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Write the matched conversation</h3><span class="system-pill">Attio + Slack</span></div>
+              <p class="step-lead">Once the company is on the pipeline, these writes run from the selected person/company/chat identity.</p>
+              <div class="write-grid">
+                <div class="write-card"><h4>Cache identity</h4><p>Overwrite the person's <span class="mono">linkedin_urn</span> with the Unipile counterpart URN.</p><div class="target">people/{personId}</div></div>
+                <div class="write-card"><h4>Replace the transcript note</h4><p>Rebuild up to 45,000 characters from the full thread, create a new company note, delete the prior note for this chat, then save the new note ID.</p><div class="target">company.linkedin_note_id = { chatId: noteId }</div></div>
+                <div class="write-card"><h4>Set latest interaction date</h4><p>Set <span class="mono">last_follow_up</span> for inbound or outbound only when the event's Tbilisi date is later than the stored date.</p><div class="target">cold_calling entry.last_follow_up</div></div>
+                <div class="write-card"><h4>Count a follow-up</h4><p>Increment only for an outbound message after another outbound message, on a later Tbilisi day, while the stage is Unprocessed, Not qualified, or Qualified.</p><div class="target">cold_calling entry.number_of_follow_ups</div></div>
+                <div class="write-card"><h4>Mark who interacted</h4><p>Patch the company to "Us" for outbound and "Them" for inbound. This occurs before pipeline membership is known.</p><div class="target">company.last_interaction_by</div></div>
+                <div class="write-card"><h4>Notify on replies</h4><p>Every matched inbound event posts a Slack reply card. Outbound events do not.</p><div class="target">Slack #linkedin reply channel</div></div>
+              </div>
+            </div>
+          </article>
+        </div>
+        <p class="footnote">Source: active production workflow read from n8n on 27 Aug 2026. Only decisions, identity rules, persistence, and side effects are represented.</p>
+      </section>
+
+      <section class="panel" id="nightly" role="tabpanel" aria-labelledby="tab-nightly" hidden>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Workflow 02 / reconciliation path</p>
+            <h2>Rebuild recent and historical chats</h2>
+            <p>The reconciler covers messages the webhook missed and threads that only became matchable after an Attio person was created. Its duplicate-contact behavior is different from the live path.</p>
+          </div>
+          <span class="mode-badge">Active &middot; 44 implementation nodes</span>
+        </div>
+
+        <div class="summary-strip">
+          <div class="metric"><span>Daily</span><strong>Mon-Sat, 03:00 instance time</strong></div>
+          <div class="metric"><span>Daily window</span><strong>Rolling 26 hours</strong></div>
+          <div class="metric"><span>Weekly</span><strong>Sunday, 04:00 instance time</strong></div>
+          <div class="metric"><span>Sweep window</span><strong>0-92 days</strong></div>
+        </div>
+
+        <div class="flow">
+          <article class="step">
+            <div class="step-no">01</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Select one-to-one chats for three mailboxes</h3><span class="system-pill">Schedule + Unipile</span></div>
+              <p class="step-lead">Each mailbox is queried separately. A chat proceeds only if it is type 0 (one-to-one), has a counterpart provider ID, belongs to one of the configured accounts, and falls inside the time window.</p>
+              <div class="rule-grid">
+                <div class="rule info"><b>Daily overlap</b><span>26 hours intentionally overlaps runs so a late or missed run can be recovered.</span></div>
+                <div class="rule info"><b>Weekly sweep</b><span>Current configuration scans the last 92 days.</span></div>
+                <div class="rule"><b>Pagination</b><span>Up to 40 pages of 100 chats per account.</span></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-no">02</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Match the Attio person using the same ladder</h3><span class="system-pill">Attio people</span></div>
+              <p class="step-lead">URN is preferred; exact full-name variants are the fallback. Unlike the live path, duplicate candidates are expanded and tested against the pipeline.</p>
+              <div class="decision-box">
+                <div class="branches">
+                  <div class="branch go"><strong>One person + company</strong>Continue with that person's linked company.</div>
+                  <div class="branch note"><strong>2+ matching people</strong>Keep only candidates that have a linked company, then inspect each company's list membership.</div>
+                  <div class="branch halt"><strong>No person or no linked company</strong>Nothing to sync. No create-person path exists here.</div>
+                  <div class="branch halt"><strong>Counterpart has no display name</strong>The chat is unusable and stops before Attio lookup.</div>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-no">03</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Resolve duplicate people by pipeline membership</h3><span class="system-pill">Current tie-breaker</span></div>
+              <p class="step-lead">For ambiguous URN or exact-name matches, candidates are expanded. Only candidates that first pass the note-based "Needs Sync" gate reach the company pipeline check.</p>
+              <div class="decision-box">
+                <div class="branches">
+                  <div class="branch go"><strong>Exactly 1 surviving candidate company is on <span class="mono">cold_calling</span></strong>That person's record wins and the chat is synced. Slack still reports the original duplicate set.</div>
+                  <div class="branch halt"><strong>0 surviving candidate companies are on the pipeline</strong>Write nothing and alert.</div>
+                  <div class="branch halt"><strong>2+ surviving candidate companies are on the pipeline</strong>Write nothing and alert. There is no next tie-breaker.</div>
+                  <div class="branch note"><strong>This is selection, not deduplication</strong>No people or companies are merged and no duplicate record is removed.</div>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-no">04</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Skip stable historical notes; rebuild active ones</h3><span class="system-pill">Note map</span></div>
+              <p class="step-lead">The company field <span class="mono">linkedin_note_id</span> is treated as a JSON map from Unipile chat ID to Attio note ID.</p>
+              <div class="decision-box">
+                <div class="branches">
+                  <div class="branch go"><strong>No map entry for this chat</strong>Sync the chat.</div>
+                  <div class="branch go"><strong>Chat active in the last 4 days</strong>Sync again even when a note ID exists.</div>
+                  <div class="branch halt"><strong>Map entry exists + no activity for 4 days</strong>Mark "Already Synced" and do nothing.</div>
+                  <div class="branch wait"><strong>Legacy bare note ID</strong>Parsing fails; the map is treated as empty, so the chat is rebuilt.</div>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-no">05</div>
+            <div class="step-body">
+              <div class="step-titleline"><h3>Derive CRM state from the full thread</h3><span class="system-pill">Reconciliation writes</span></div>
+              <div class="write-grid">
+                <div class="write-card"><h4>Latest interaction date</h4><p>Use the newest message of either direction. Only move the stored date forward.</p></div>
+                <div class="write-card"><h4>Last interaction by</h4><p>Use the direction of the newest message: "Us" or "Them".</p></div>
+                <div class="write-card"><h4>Follow-up count</h4><p>Count every consecutive us-to-us message pair on different Tbilisi days across the full thread.</p></div>
+                <div class="write-card"><h4>Counter overwrite rule</h4><p>Only backfill the derived count when Attio's current value is missing or zero. A nonzero value is preserved even if wrong.</p></div>
+                <div class="write-card"><h4>Identity cache</h4><p>Write the counterpart URN onto the selected Attio person.</p></div>
+                <div class="write-card"><h4>Transcript note</h4><p>Create the replacement note, delete the old chat note, then group note-map updates into one company patch.</p></div>
+              </div>
+            </div>
+          </article>
+        </div>
+        <p class="footnote">The daily and weekly triggers feed the same reconciliation logic. The weekly 92-day range is an editable slice in the current code.</p>
+      </section>
+
+      <section class="panel" id="rules" role="tabpanel" aria-labelledby="tab-rules" hidden>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Workflow 03 / exact rules</p>
+            <h2>What "matching" and "dedupe" mean today</h2>
+            <p>This is the shortest operational reference: which key is used, what counts as a collision, and what the system does next.</p>
+          </div>
+          <span class="mode-badge">Current behavior</span>
+        </div>
+
+        <div class="ladder" aria-label="Contact matching ladder">
+          <div class="rung"><div class="rung-num">1</div><div><h3>Normalize the Unipile display name</h3><p>Create raw, whitespace-collapsed, and decoration-stripped variants.</p></div><div class="rung-result">No fuzzy, token, nickname, email, or domain matching.</div></div>
+          <div class="rung"><div class="rung-num">2</div><div><h3>Query Attio with one OR filter</h3><p><span class="mono">linkedin_urn = provider ID</span> OR <span class="mono">name.full_name = exact variant</span>. Limit 25.</p></div><div class="rung-result">The query can return URN and name candidates together.</div></div>
+          <div class="rung"><div class="rung-num">3</div><div><h3>Prefer the URN result set</h3><p>Exactly one URN match wins. Two or more is considered duplicate-person ambiguity.</p></div><div class="rung-result">A unique URN match ignores any conflicting name candidates.</div></div>
+          <div class="rung"><div class="rung-num">4</div><div><h3>Fallback to exact full name</h3><p>Only when no URN result exists. Exactly one normalized exact-name match wins.</p></div><div class="rung-result">No independent evidence is required for this fallback.</div></div>
+          <div class="rung"><div class="rung-num">5</div><div><h3>Resolve or stop on ambiguity</h3><p>Live stops. Reconciler chooses only if exactly one candidate's linked company is on the Outbound Pipeline.</p></div><div class="rung-result">Duplicates remain in Attio either way.</div></div>
+        </div>
+
+        <div class="table-card" style="margin-top:22px">
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Layer</th><th>Key / rule</th><th>Retention</th><th>Collision behavior</th><th>What it does not do</th></tr></thead>
+              <tbody>
+                <tr><td>Webhook delivery</td><td>Exact Unipile <span class="mono">message_id</span></td><td>Last 2,000 IDs in n8n workflow static data</td><td>Repeated ID is dropped before all downstream writes</td><td>No durable success marker; no replay after partial failure<br><span class="status-tag risk">At-most-once risk</span></td></tr>
+                <tr><td>Attio person</td><td>Exact cached LinkedIn URN; otherwise exact normalized full name</td><td>URN is cached onto the person after pipeline membership passes</td><td>Live: skip. Reconciler: use unique Outbound Pipeline candidate</td><td>No merge, email check, company-domain check, or fuzzy match<br><span class="status-tag partial">Selection only</span></td></tr>
+                <tr><td>Company</td><td>The chosen person's first linked company relation</td><td>Existing Attio relation</td><td>No company candidate set exists</td><td>No company-name/domain dedupe and no relationship verification<br><span class="status-tag risk">Single relation trusted</span></td></tr>
+                <tr><td>Slack miss alert</td><td>Counterpart URN, else normalized name</td><td>24-hour timestamp map in workflow static data</td><td>Later inbound misses for the same key are suppressed</td><td>Outbound misses are never alerted by this alert path<br><span class="status-tag partial">Notification only</span></td></tr>
+                <tr><td>Transcript note</td><td>Unipile <span class="mono">chatId</span> inside company JSON map</td><td>Stored in <span class="mono">company.linkedin_note_id</span></td><td>One current note ID per chat; recent threads are replaced</td><td>Does not dedupe the same human across two rep chats<br><span class="status-tag safe">Per-chat identity</span></td></tr>
+                <tr><td>Nightly note writes</td><td>Group new <span class="mono">chatId: noteId</span> pairs by company</td><td>One map patch per company per run</td><td>Prevents concurrent chat updates from overwriting sibling map keys</td><td>Does not make create/delete/map-patch one atomic transaction<br><span class="status-tag partial">Write-loss guard</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <p class="footnote">Terminology in this view is deliberately strict: suppressing a delivery, selecting one candidate, and merging duplicate CRM records are three different operations.</p>
+      </section>
+
+      <section class="panel" id="risks" role="tabpanel" aria-labelledby="tab-risks" hidden>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Workflow 04 / current breakpoints</p>
+            <h2>Where the current behavior can produce the wrong outcome</h2>
+            <p>These are implementation-observed risks from the active workflows, not hypothetical nodes or proposed redesigns.</p>
+          </div>
+          <span class="mode-badge" style="color:#a22d38;border-color:#f2b9be;background:#fff7f7">Needs handling</span>
+        </div>
+
+        <div class="risk-grid">
+          <article class="risk-card"><span class="risk-index">01</span><h3>A failed write can be permanently "deduped"</h3><p>The webhook adds <span class="mono">message_id</span> to the seen list before Attio, Slack, or note writes finish. A redelivery after downstream failure is dropped as a duplicate.</p><div class="effect">Effect: silent missing or partially written interactions.</div></article>
+          <article class="risk-card"><span class="risk-index">02</span><h3>The delivery ledger is a volatile rolling list</h3><p>Only the last 2,000 IDs are retained in n8n static data. It is not a durable table with processing status, timestamps, attempts, or completed side effects.</p><div class="effect">Effect: old redeliveries can run again; incomplete runs cannot be distinguished from complete runs.</div></article>
+          <article class="risk-card"><span class="risk-index">03</span><h3>Exact name alone can select a person</h3><p>When the URN is absent, one exact normalized full-name result wins without checking email, LinkedIn URL, employer, domain, or the message participant's profile.</p><div class="effect">Effect: a unique but wrong same-name record can receive the transcript and activity.</div></article>
+          <article class="risk-card"><span class="risk-index">04</span><h3>Live and nightly resolve duplicates differently</h3><p>The webhook rejects every multi-person match. The reconciler can choose one duplicate based solely on whether exactly one candidate's company is on the Outbound Pipeline.</p><div class="effect">Effect: the same chat can be rejected live but attributed later by a different rule.</div></article>
+          <article class="risk-card"><span class="risk-index">05</span><h3>The 15-minute "found" branch does not sync</h3><p>If a missing inbound person appears during the wait, the recheck only sees that the query returned a row and ends at Silent Skip. It never resolves the row or logs the triggering message.</p><div class="effect">Effect: the original inbound depends on a later reconciler run.</div></article>
+          <article class="risk-card"><span class="risk-index">06</span><h3>Company choice is not matched</h3><p>The person's linked company relation is accepted as truth. The workflow does not verify it against LinkedIn occupation, company name, domain, or any second relation.</p><div class="effect">Effect: a correct person with a stale company relation writes to the wrong account.</div></article>
+          <article class="risk-card"><span class="risk-index">07</span><h3>The workflow can leave partial state</h3><p><span class="mono">last_interaction_by</span> is patched before Outbound Pipeline membership. Note replacement also spans create, delete, and map-patch calls without a transaction.</p><div class="effect">Effect: company activity can change when the rest is skipped; note/map state can diverge on mid-run failure.</div></article>
+          <article class="risk-card"><span class="risk-index">08</span><h3>"Duplicate handling" never repairs duplicates</h3><p>Candidate records are summarized in Slack, but the automations do not merge people, consolidate URNs, choose a canonical record persistently, or migrate relationships.</p><div class="effect">Effect: the same ambiguity recurs until a human changes Attio.</div></article>
+          <article class="risk-card"><span class="risk-index">09</span><h3>Note state filters candidates before duplicate resolution</h3><p>In the reconciler, an ambiguous candidate with an existing, inactive note map is removed by "Already Synced" before pipeline membership is compared. The resolver only sees the candidates that still need a note sync.</p><div class="effect">Effect: the duplicate tie-breaker does not always compare the full candidate set.</div></article>
+        </div>
+
+        <div class="notice" style="margin-top:20px">
+          <div class="notice-mark">&rarr;</div>
+          <div><strong>The highest-leverage fix area is identity + idempotency, before field writes.</strong><p>A durable event ledger, explicit match evidence, one canonical contact decision, and a resumable write state would remove several of these failure modes together.</p></div>
+        </div>
+        <p class="footnote print-note">End of current-state workflow audit.</p>
+      </section>
+    </main>
+  </div>
+
   <script>
-    const viewport=document.querySelector('#viewport'), board=document.querySelector('#board'), label=document.querySelector('#zoom'); let scale=.9,x=20,y=20,drag=false,sx=0,sy=0;
-    const render=()=>{ board.style.transform=`translate(${x}px,${y}px) scale(${scale})`; label.textContent=`${Math.round(scale*100)}%`; };
-    const setZoom=d=>{scale=Math.max(.45,Math.min(1.35,scale+d));render()}; document.querySelector('#in').onclick=()=>setZoom(.1);document.querySelector('#out').onclick=()=>setZoom(-.1);document.querySelector('#reset').onclick=()=>{scale=.9;x=20;y=20;render()};
-    viewport.addEventListener('pointerdown',e=>{drag=true;sx=e.clientX-x;sy=e.clientY-y;viewport.classList.add('dragging');viewport.setPointerCapture(e.pointerId)});viewport.addEventListener('pointermove',e=>{if(!drag)return;x=e.clientX-sx;y=e.clientY-sy;render()});viewport.addEventListener('pointerup',()=>{drag=false;viewport.classList.remove('dragging')}); viewport.addEventListener('wheel',e=>{e.preventDefault();setZoom(e.deltaY<0?.08:-.08)},{passive:false}); render();
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+
+    function activate(tab, moveFocus = false) {
+      const target = tab.dataset.target;
+      tabs.forEach((item) => item.setAttribute('aria-selected', String(item === tab)));
+      panels.forEach((panel) => {
+        const active = panel.id === target;
+        panel.classList.toggle('active', active);
+        panel.hidden = !active;
+      });
+      if (moveFocus) tab.focus();
+      history.replaceState(null, '', '#' + target);
+      window.scrollTo({ top: 0, behavior: 'instant' });
+    }
+
+    tabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => activate(tab));
+      tab.addEventListener('keydown', (event) => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        let next = index;
+        if (event.key === 'ArrowLeft') next = (index - 1 + tabs.length) % tabs.length;
+        if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+        if (event.key === 'Home') next = 0;
+        if (event.key === 'End') next = tabs.length - 1;
+        activate(tabs[next], true);
+      });
+    });
+
+    const initial = location.hash.slice(1);
+    const initialTab = tabs.find((tab) => tab.dataset.target === initial);
+    if (initialTab) activate(initialTab);
   </script>
 </body>
 </html>

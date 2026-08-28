@@ -1,0 +1,244 @@
+{
+  "linkedin_attio_event_ledger": {
+    "id": "y3BvGIGRQqVrpGM7",
+    "projectId": "Kpi0jPRG9V8d3lxr",
+    "columns": [
+      {
+        "name": "event_key",
+        "type": "string"
+      },
+      {
+        "name": "account_id",
+        "type": "string"
+      },
+      {
+        "name": "chat_id",
+        "type": "string"
+      },
+      {
+        "name": "message_id",
+        "type": "string"
+      },
+      {
+        "name": "event_timestamp",
+        "type": "date"
+      },
+      {
+        "name": "direction",
+        "type": "string"
+      },
+      {
+        "name": "status",
+        "type": "string"
+      },
+      {
+        "name": "attempts",
+        "type": "number"
+      },
+      {
+        "name": "completed_steps",
+        "type": "string"
+      },
+      {
+        "name": "outputs",
+        "type": "string"
+      },
+      {
+        "name": "last_error",
+        "type": "string"
+      },
+      {
+        "name": "normalized_event",
+        "type": "string"
+      },
+      {
+        "name": "case_key",
+        "type": "string"
+      },
+      {
+        "name": "person_id",
+        "type": "string"
+      },
+      {
+        "name": "company_id",
+        "type": "string"
+      },
+      {
+        "name": "started_at",
+        "type": "date"
+      },
+      {
+        "name": "updated_at",
+        "type": "date"
+      },
+      {
+        "name": "next_retry_at",
+        "type": "date"
+      },
+      {
+        "name": "stale_after",
+        "type": "date"
+      },
+      {
+        "name": "cleanup_note_id",
+        "type": "string"
+      }
+    ]
+  },
+  "linkedin_attio_case_ledger": {
+    "id": "MwDh3e70jYQpCgy3",
+    "projectId": "Kpi0jPRG9V8d3lxr",
+    "columns": [
+      {
+        "name": "case_key",
+        "type": "string"
+      },
+      {
+        "name": "account_id",
+        "type": "string"
+      },
+      {
+        "name": "chat_id",
+        "type": "string"
+      },
+      {
+        "name": "reason",
+        "type": "string"
+      },
+      {
+        "name": "status",
+        "type": "string"
+      },
+      {
+        "name": "person_id",
+        "type": "string"
+      },
+      {
+        "name": "candidate_ids",
+        "type": "string"
+      },
+      {
+        "name": "company_id",
+        "type": "string"
+      },
+      {
+        "name": "slack_channel",
+        "type": "string"
+      },
+      {
+        "name": "slack_ts",
+        "type": "string"
+      },
+      {
+        "name": "message_count",
+        "type": "number"
+      },
+      {
+        "name": "latest_preview",
+        "type": "string"
+      },
+      {
+        "name": "event_keys",
+        "type": "string"
+      },
+      {
+        "name": "resolution",
+        "type": "string"
+      },
+      {
+        "name": "resolved_at",
+        "type": "date"
+      },
+      {
+        "name": "updated_at",
+        "type": "date"
+      },
+      {
+        "name": "action_nonce",
+        "type": "string"
+      },
+      {
+        "name": "action_result",
+        "type": "string"
+      },
+      {
+        "name": "company_name",
+        "type": "string"
+      },
+      {
+        "name": "company_domain",
+        "type": "string"
+      },
+      {
+        "name": "company_evidence",
+        "type": "string"
+      }
+    ]
+  },
+  "linkedin_attio_chat_state": {
+    "id": "eizQME9YrnBD2rDB",
+    "projectId": "Kpi0jPRG9V8d3lxr",
+    "columns": [
+      {
+        "name": "sync_key",
+        "type": "string"
+      },
+      {
+        "name": "account_id",
+        "type": "string"
+      },
+      {
+        "name": "chat_id",
+        "type": "string"
+      },
+      {
+        "name": "company_id",
+        "type": "string"
+      },
+      {
+        "name": "person_id",
+        "type": "string"
+      },
+      {
+        "name": "newest_committed_at",
+        "type": "date"
+      },
+      {
+        "name": "newest_message_id",
+        "type": "string"
+      },
+      {
+        "name": "last_direction",
+        "type": "string"
+      },
+      {
+        "name": "note_id",
+        "type": "string"
+      },
+      {
+        "name": "cleanup_note_id",
+        "type": "string"
+      },
+      {
+        "name": "history_cursor",
+        "type": "string"
+      },
+      {
+        "name": "history_truncated",
+        "type": "boolean"
+      },
+      {
+        "name": "lock_until",
+        "type": "date"
+      },
+      {
+        "name": "lock_owner",
+        "type": "string"
+      },
+      {
+        "name": "updated_at",
+        "type": "date"
+      }
+    ]
+  }
+}

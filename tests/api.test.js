@@ -4,11 +4,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createApp } from "../server.js";
-import { REPS, LINKEDIN_SENDERS } from "../src/constants.js";
+import { EMAIL_SENDERS, REPS, LINKEDIN_SENDERS } from "../src/constants.js";
 
-async function withServer(run) {
+async function withServer(run, options = {}) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "followup-api-"));
-  const instance = createApp({ mock: true, dataDir: dir });
+  const instance = createApp({ mock: true, dataDir: dir, ...options });
   const server = await new Promise((resolve) => {
     const listener = instance.app.listen(0, "127.0.0.1", () => resolve(listener));
   });
@@ -48,32 +48,127 @@ test("mock sync returns the four priority buckets in order", () => withServer(as
 test("sync interval is one hour", () => withServer(async ({ request }) => {
   const { body } = await request("/api/config");
   assert.equal(body.syncIntervalMs, 60 * 60_000);
-  assert.equal(body.emailComposerProvider, "gmail");
-  assert.equal(body.gmailThreadLookupEnabled, true);
+  assert.deepEqual(body.emailSenders, EMAIL_SENDERS);
+  assert.equal(body.gmailSendAvailable, true);
+  assert.equal("emailComposerProvider" in body, false);
 }));
 
-test("email lookup only searches contacts authorized by the current queue", () => withServer(async ({ request }) => {
+test("email resolution requires a synchronized exact contact and allowlisted sender", () => withServer(async ({ request }) => {
+  const payload = {
+    ownerId: REPS[0].id,
+    entryId: "entry-oyster",
+    personId: "person-maya",
+    email: "maya@oysterhr.com",
+    senderId: EMAIL_SENDERS[0].id,
+  };
   const denied = await request("/api/email/resolve", {
     method: "POST",
-    body: JSON.stringify({ ownerId: REPS[0].id, email: "maya@oysterhr.com" }),
+    body: JSON.stringify(payload),
   });
   assert.equal(denied.response.status, 409);
 
   await request("/api/sync", { method: "POST", body: JSON.stringify({ ownerId: REPS[0].id }) });
   const existing = await request("/api/email/resolve", {
     method: "POST",
-    body: JSON.stringify({ ownerId: REPS[0].id, email: "maya@oysterhr.com" }),
+    body: JSON.stringify(payload),
   });
-  assert.equal(existing.body.found, true);
-  assert.equal(existing.body.mailbox, "sandro@stimuli.digital");
-  assert.equal(existing.body.threadId, "mock-gmail-thread-maya");
+  assert.equal(existing.body.mode, "reply");
+  assert.equal(existing.body.sender.email, "sandro@stimuli.digital");
+  assert.equal(existing.body.thread.id, "mock-gmail-thread-maya");
+  assert.equal(existing.body.messages.length, 2);
+  assert.ok(existing.body.authorizationId);
 
   const unknown = await request("/api/email/resolve", {
     method: "POST",
-    body: JSON.stringify({ ownerId: REPS[0].id, email: "unknown@example.com" }),
+    body: JSON.stringify({ ...payload, email: "unknown@example.com" }),
   });
   assert.equal(unknown.response.status, 409);
+
+  const wrongPerson = await request("/api/email/resolve", {
+    method: "POST",
+    body: JSON.stringify({ ...payload, personId: "person-jules" }),
+  });
+  assert.equal(wrongPerson.response.status, 409);
+
+  const unallowlisted = await request("/api/email/resolve", {
+    method: "POST",
+    body: JSON.stringify({ ...payload, senderId: "attacker@example.com" }),
+  });
+  assert.equal(unallowlisted.response.status, 400);
 }));
+
+test("all three Gmail identities resolve independently of queue ownership", () => withServer(async ({ request }) => {
+  await request("/api/sync", { method: "POST", body: JSON.stringify({ ownerId: REPS[0].id }) });
+  const modes = [];
+  for (const sender of EMAIL_SENDERS) {
+    const resolved = await request("/api/email/resolve", {
+      method: "POST",
+      body: JSON.stringify({
+        ownerId: REPS[0].id,
+        entryId: "entry-oyster",
+        personId: "person-maya",
+        email: "maya@oysterhr.com",
+        senderId: sender.id,
+      }),
+    });
+    assert.equal(resolved.response.status, 200);
+    assert.equal(resolved.body.sender.email, sender.email);
+    modes.push(resolved.body.mode);
+  }
+  assert.deepEqual(modes, ["reply", "new", "reply"]);
+}));
+
+test("Gmail new and reply sends are successful and idempotent", () => withServer(async ({ request }) => {
+  await request("/api/sync", { method: "POST", body: JSON.stringify({ ownerId: REPS[0].id }) });
+  const base = { ownerId: REPS[0].id, entryId: "entry-oyster", personId: "person-maya", email: "maya@oysterhr.com" };
+  const resolve = async (senderId) => (await request("/api/email/resolve", {
+    method: "POST", body: JSON.stringify({ ...base, senderId }),
+  })).body;
+
+  const replyAuthorization = await resolve(EMAIL_SENDERS[0].id);
+  const replyPayload = {
+    authorizationId: replyAuthorization.authorizationId,
+    idempotencyKey: "gmail-reply-once",
+    ownerId: base.ownerId,
+    entryId: base.entryId,
+    personId: base.personId,
+    subject: "Browser supplied subject is ignored",
+    message: "Replying in the existing thread.",
+  };
+  const reply = await request("/api/email/send", { method: "POST", body: JSON.stringify(replyPayload) });
+  assert.equal(reply.response.status, 200);
+  assert.equal(reply.body.receipt.accountId, EMAIL_SENDERS[0].email);
+  assert.equal(reply.body.receipt.chatId, "mock-gmail-thread-maya");
+  const duplicate = await request("/api/email/send", { method: "POST", body: JSON.stringify(replyPayload) });
+  assert.equal(duplicate.body.duplicate, true);
+
+  const newAuthorization = await resolve(EMAIL_SENDERS[1].id);
+  const missingSubject = await request("/api/email/send", {
+    method: "POST",
+    body: JSON.stringify({ ...replyPayload, authorizationId: newAuthorization.authorizationId, idempotencyKey: "gmail-no-subject", subject: "" }),
+  });
+  assert.equal(missingSubject.response.status, 400);
+  const fresh = await request("/api/email/send", {
+    method: "POST",
+    body: JSON.stringify({ ...replyPayload, authorizationId: newAuthorization.authorizationId, idempotencyKey: "gmail-new-once", subject: "A new subject" }),
+  });
+  assert.equal(fresh.response.status, 200);
+  assert.equal(fresh.body.receipt.accountId, EMAIL_SENDERS[1].email);
+}));
+
+test("expired Gmail authorization cannot send", () => withServer(async ({ request }) => {
+  await request("/api/sync", { method: "POST", body: JSON.stringify({ ownerId: REPS[0].id }) });
+  const resolved = await request("/api/email/resolve", {
+    method: "POST",
+    body: JSON.stringify({ ownerId: REPS[0].id, entryId: "entry-oyster", personId: "person-maya", email: "maya@oysterhr.com", senderId: EMAIL_SENDERS[0].id }),
+  });
+  const sent = await request("/api/email/send", {
+    method: "POST",
+    body: JSON.stringify({ authorizationId: resolved.body.authorizationId, idempotencyKey: "stale-gmail", ownerId: REPS[0].id, entryId: "entry-oyster", personId: "person-maya", message: "Must not send" }),
+  });
+  assert.equal(sent.response.status, 409);
+  assert.match(sent.body.error, /expired/i);
+}, { emailAuthorizationTtlMs: 0 }));
 
 test("SendPilot resolution is independent of the Attio source", () => withServer(async ({ request }) => {
   const campaign = await request("/api/sendpilot/resolve", {

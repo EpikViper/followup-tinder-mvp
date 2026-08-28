@@ -2,6 +2,7 @@ node_modules/
 data/*.sqlite*
 test-results/
 playwright-report/
+docs/integration/backups/
 .env
 .DS_Store
 npm-debug.log*

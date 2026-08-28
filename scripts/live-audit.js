@@ -22,9 +22,11 @@ for (const rep of REPS) {
     eligible: queue.length,
     byType,
     unprocessedReadyToPromote: companies.filter((company) => company.stage === "Unprocessed" && company.lastInteractionBy === "Us").length,
-    missingContacts: queue.filter((company) => company.contacts.length === 0).length,
-    missingLinkedin: queue.filter((company) => !company.contacts[0]?.linkedinUrl).length,
-    missingEmail: queue.filter((company) => !company.contacts.some((contact) => contact.emails.length)).length,
+    missingDomains: queue.filter((company) => !company.domains?.length).length,
+    missingContacts: queue.filter((company) => !company.contacts.length).length,
+    contactsMissingLinkedin: queue.flatMap((company) => company.contacts).filter((contact) => !contact.linkedinUrl).length,
+    contactsMissingEmail: queue.flatMap((company) => company.contacts).filter((contact) => !contact.emails.length).length,
+    contactsMissingPhone: queue.flatMap((company) => company.contacts).filter((contact) => !contact.phones?.length).length,
   });
 }
 

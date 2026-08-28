@@ -13,3 +13,23 @@
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+
+#email-dialog .sender-options {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.email-thread {
+  max-height: 220px;
+  margin: 14px 0;
+}
+
+#email-subject:read-only {
+  cursor: default;
+  background: rgba(124, 134, 255, 0.06);
+}
+
+@media (max-width: 620px) {
+  #email-dialog .sender-options { grid-template-columns: 1fr; }
+  #email-dialog { padding: 24px 18px; }
+  .email-thread { max-height: 180px; }
+}

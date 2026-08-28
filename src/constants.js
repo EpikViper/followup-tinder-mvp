@@ -13,10 +13,14 @@ export const REPS = [
   },
 ];
 
-export const GMAIL_MAILBOXES_BY_OWNER = {
-  "d9d9526a-9718-4861-a3b4-cc7e47f2b596": ["sandro@stimuli.digital"],
-  "5daf99ac-0118-48c8-aad0-06ed2ac707b3": ["sergi@stimuli.digital", "sergi@revcode.app"],
-};
+// Email sender choice is deliberately independent of Attio queue ownership.
+// IDs are the exact delegated Gmail mailboxes so the server never has to map a
+// browser-supplied alias to a more privileged account.
+export const EMAIL_SENDERS = [
+  { id: "sandro@stimuli.digital", name: "Sandro Truman", email: "sandro@stimuli.digital" },
+  { id: "sergi@stimuli.digital", name: "Sergi Cheishvili", email: "sergi@stimuli.digital" },
+  { id: "sergi@revcode.app", name: "Sergi Cheishvili", email: "sergi@revcode.app" },
+];
 
 // Sender identity is deliberately independent of Attio ownership.
 export const LINKEDIN_SENDERS = [

@@ -31,6 +31,7 @@ export class MockAttioClient {
             emails: ["maya@oysterhr.com"],
             linkedinUrl: "https://www.linkedin.com/in/mayapatel",
             linkedinUrn: "urn-maya",
+            phones: ["+15550000001"],
           },
           {
             id: "person-jules",
@@ -173,6 +174,45 @@ export class MockAttioClient {
       }
     }
     throw new Error("Mock person not found");
+  }
+
+  async updatePersonPhones(personId, phones) {
+    for (const company of this.companies) {
+      const person = company.contacts.find((contact) => contact.id === personId);
+      if (person) { person.phones = [...phones]; return clone(person); }
+    }
+    throw new Error("Mock person not found");
+  }
+
+  async updatePersonEmails(personId, emails) {
+    for (const company of this.companies) {
+      const person = company.contacts.find((contact) => contact.id === personId);
+      if (person) { person.emails = [...emails]; return clone(person); }
+    }
+    throw new Error("Mock person not found");
+  }
+
+  async updateCompanyDomains(companyId, domains) {
+    const company = this.companies.find((item) => item.companyId === companyId);
+    if (!company) throw new Error("Mock company not found");
+    company.domains = [...domains];
+    return clone(company);
+  }
+
+  async createPerson({ companyId, name, linkedinUrl, email = null, phone = null }) {
+    const company = this.companies.find((item) => item.companyId === companyId);
+    if (!company) throw new Error("Mock company not found");
+    const person = { id: `person-created-${Date.now()}`, name, linkedinUrl, linkedinUrn: null, emails: email ? [email] : [], phones: phone ? [phone] : [] };
+    company.contacts.push(person);
+    return { data: { id: { record_id: person.id } } };
+  }
+
+  async deleteNote(noteId) {
+    for (const notes of Object.values(this.notes)) {
+      const index = notes.findIndex((note) => note.id === noteId);
+      if (index >= 0) { notes.splice(index, 1); return; }
+    }
+    throw new Error("Mock note not found");
   }
 
   async repairInteraction({ entryId, direction, date }) {
@@ -334,21 +374,48 @@ export class MockSendPilotClient {
 export class MockGmailClient {
   constructor() {
     this.configured = true;
+    this.reset();
   }
 
-  async findLatestThread({ ownerId, email }) {
-    if (ownerId === REPS[0].id && email.toLowerCase() === "maya@oysterhr.com") {
+  async resolveThread({ mailbox, email }) {
+    if (mailbox === "sandro@stimuli.digital" && email.toLowerCase() === "maya@oysterhr.com") {
       return {
         found: true,
+        mode: "reply",
         mailbox: "sandro@stimuli.digital",
         threadId: "mock-gmail-thread-maya",
-        subject: "Re: Oyster follow-up",
+        subject: "Oyster follow-up",
         lastMessageAt: "2026-08-25T12:00:00.000Z",
-        url: "https://mail.google.com/mail/u/sandro@stimuli.digital/#all/mock-gmail-thread-maya",
+        messages: [
+          { id: "gmail-1", from: "Sandro Truman <sandro@stimuli.digital>", to: "Maya Patel <maya@oysterhr.com>", sentAt: "2026-08-24T10:00:00.000Z", isSender: true, text: "Would it help if I sent the short workflow?" },
+          { id: "gmail-2", from: "Maya Patel <maya@oysterhr.com>", to: "Sandro Truman <sandro@stimuli.digital>", sentAt: "2026-08-25T12:00:00.000Z", isSender: false, text: "Yes, please send it over." },
+        ],
       };
     }
-    return { found: false };
+    if (mailbox === "sergi@revcode.app" && email.toLowerCase() === "maya@oysterhr.com") {
+      return {
+        found: true,
+        mode: "reply",
+        mailbox,
+        threadId: "mock-gmail-thread-maya-revcode",
+        subject: "Revcode introduction",
+        lastMessageAt: "2026-08-23T09:00:00.000Z",
+        messages: [{ id: "gmail-3", from: "Sergi Cheishvili <sergi@revcode.app>", to: "maya@oysterhr.com", sentAt: "2026-08-23T09:00:00.000Z", isSender: true, text: "Sharing a quick introduction from Revcode." }],
+      };
+    }
+    return { found: false, mode: "new", subject: "", messages: [] };
   }
 
-  reset() {}
+  async sendEmail({ mailbox, email, cc = [], subject, body, reply }) {
+    if (body === "MOCK_GMAIL_FAILURE") throw new Error("Mock Gmail delivery failed");
+    const resolved = await this.resolveThread({ mailbox, email });
+    const threadId = reply ? resolved.threadId : `mock-gmail-thread-${this.sent.length + 1}`;
+    const messageId = `mock-gmail-message-${this.sent.length + 1}`;
+    this.sent.push({ mailbox, email, cc, subject: reply ? resolved.subject : subject, body, reply, threadId, messageId });
+    return { messageId, threadId, subject: reply ? resolved.subject : subject };
+  }
+
+  reset() {
+    this.sent = [];
+  }
 }

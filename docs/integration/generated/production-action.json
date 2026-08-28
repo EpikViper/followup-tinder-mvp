@@ -1,0 +1,735 @@
+{
+  "name": "LinkedIn unmatched -> create in Attio",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "linkedin-create-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "create-link",
+      "name": "Create Link",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "8c2d5f10-4b7e-4a3c-9d61-0e5a7b19c4f2"
+    },
+    {
+      "id": "action-parse-signed-action",
+      "name": "Parse signed action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst q=$input.first().json.query||{};const allowed=['same_person','different_person','qualified','not_qualified'];let payload={};try{payload=JSON.parse(decodeURIComponent(q.p||''));}catch{}\nconst type=String(q.a||'');const caseKey=String(q.k||payload.caseKey||'');return [{json:{ok:Boolean(caseKey&&allowed.includes(type)),caseKey,eventKey:String(payload.eventKey||''),action:{type,candidateId:String(payload.candidateId||'')}}}];\n"
+      }
+    },
+    {
+      "id": "action-valid-action",
+      "name": "Valid action?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "action-show-bad-action",
+      "name": "Show bad action",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "This review link is invalid or incomplete.",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "action-dt-revalidate-case",
+      "name": "DT: Revalidate case",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "MwDh3e70jYQpCgy3"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "case_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.caseKey }}"
+            }
+          ]
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "action-gate-idempotent-action",
+      "name": "Gate idempotent action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst request=$('Parse signed action').first().json;const rows=$input.all().map(i=>i.json).filter(r=>r.case_key);const c=rows.sort((a,b)=>new Date(b.updated_at||0)-new Date(a.updated_at||0))[0]||{};\nreturn [{json:{...request,case:c,replay:c.status==='resolved',recorded:c.action_result||''}}];\n"
+      }
+    },
+    {
+      "id": "action-already-resolved",
+      "name": "Already resolved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "action-show-recorded-outcome",
+      "name": "Show recorded outcome",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        260,
+        220
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.recorded || 'This decision was already recorded.' }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "action-dt-claim-action",
+      "name": "DT: Claim action",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        520,
+        220
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "MwDh3e70jYQpCgy3"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "case_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.caseKey }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "case_key": "={{ $json.caseKey }}",
+            "status": "processing_action",
+            "action_nonce": "={{ $execution.id }}",
+            "updated_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "action-settle-action-claim",
+      "name": "Settle action claim",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        220
+      ],
+      "parameters": {
+        "amount": 1,
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "action-dt-recheck-action-claim",
+      "name": "DT: Recheck action claim",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        220
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "MwDh3e70jYQpCgy3"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "case_key",
+              "condition": "eq",
+              "keyValue": "={{ $('Gate idempotent action').first().json.caseKey }}"
+            }
+          ]
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "action-verify-action-claim",
+      "name": "Verify action claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const gate=$('Gate idempotent action').first().json;const row=$input.all().map(i=>i.json).find(r=>r.case_key)||{};return [{json:{...gate,ownsClaim:String(row.action_nonce||'')===String($execution.id)}}];"
+      }
+    },
+    {
+      "id": "action-action-claim-acquired",
+      "name": "Action claim acquired?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.ownsClaim }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "action-show-action-in-progress",
+      "name": "Show action in progress",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        260,
+        440
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Another decision for this case is already being processed. Refresh Slack for the recorded outcome.",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "action-dt-load-original-event",
+      "name": "DT: Load original event",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        520,
+        440
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "y3BvGIGRQqVrpGM7"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "event_key",
+              "condition": "eq",
+              "keyValue": "={{ $('Gate idempotent action').first().json.eventKey || JSON.parse($('Gate idempotent action').first().json.case.event_keys || '[]')[0] }}"
+            }
+          ]
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "action-resume-reviewed-event",
+      "name": "Resume reviewed event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        440
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst gate=$('Gate idempotent action').first().json;const row=$input.all().map(i=>i.json).find(r=>r.normalized_event);if(!row)throw new Error('Original event is unavailable');\nreturn [{json:{source:'action',event:JSON.parse(row.normalized_event),action:gate.action,preferredCompanyId:gate.case.company_id||'',companyEvidence:{name:gate.case.company_name||'',domain:gate.case.company_domain||'',evidence:gate.case.company_evidence||''}}}];\n"
+      }
+    },
+    {
+      "id": "action-revalidate-and-process-action",
+      "name": "Revalidate and process action",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        440
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "GXEe3WPRaPhgoiBC"
+        },
+        "mode": "each",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "action-record-action-outcome",
+      "name": "Record action outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        440
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst gate=$('Gate idempotent action').first().json;const result=$input.first().json||{};const text=result.ok?'Decision recorded: '+gate.action.type.replaceAll('_',' '):'Decision could not be completed: '+(result.error||result.status||'unknown error');\nreturn [{json:{...gate,result,text,ok:Boolean(result.ok)}}];\n"
+      }
+    },
+    {
+      "id": "action-dt-resolve-case",
+      "name": "DT: Resolve case",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        0,
+        660
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "MwDh3e70jYQpCgy3"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "case_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.caseKey }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "case_key": "={{ $json.caseKey }}",
+            "status": "={{ $json.ok ? 'resolved' : 'waiting_review' }}",
+            "resolution": "={{ $json.action.type }}",
+            "resolved_at": "={{ $json.ok ? $now.toISO() : null }}",
+            "updated_at": "={{ $now.toISO() }}",
+            "action_nonce": "={{ $execution.id }}",
+            "action_result": "={{ $json.text }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "action-slack-replace-case-with-outcome",
+      "name": "Slack: Replace case with outcome",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        660
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://slack.com/api/chat.update",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: $('Gate idempotent action').first().json.case.slack_channel, ts: $('Gate idempotent action').first().json.case.slack_ts, text: $('Record action outcome').first().json.text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: ($('Record action outcome').first().json.ok ? ':white_check_mark: ' : ':warning: ') + $('Record action outcome').first().json.text } }] }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "wrKST14oJKHjskWK",
+          "name": "Slack Attio Bot (xoxb)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "action-show-action-outcome",
+      "name": "Show action outcome",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        520,
+        660
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $('Record action outcome').first().json.text }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Create Link": {
+      "main": [
+        [
+          {
+            "node": "Parse signed action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse signed action": {
+      "main": [
+        [
+          {
+            "node": "Valid action?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid action?": {
+      "main": [
+        [
+          {
+            "node": "DT: Revalidate case",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Show bad action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Revalidate case": {
+      "main": [
+        [
+          {
+            "node": "Gate idempotent action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate idempotent action": {
+      "main": [
+        [
+          {
+            "node": "Already resolved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already resolved?": {
+      "main": [
+        [
+          {
+            "node": "Show recorded outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DT: Claim action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Claim action": {
+      "main": [
+        [
+          {
+            "node": "Settle action claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settle action claim": {
+      "main": [
+        [
+          {
+            "node": "DT: Recheck action claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Recheck action claim": {
+      "main": [
+        [
+          {
+            "node": "Verify action claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify action claim": {
+      "main": [
+        [
+          {
+            "node": "Action claim acquired?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Action claim acquired?": {
+      "main": [
+        [
+          {
+            "node": "DT: Load original event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Show action in progress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Load original event": {
+      "main": [
+        [
+          {
+            "node": "Resume reviewed event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resume reviewed event": {
+      "main": [
+        [
+          {
+            "node": "Revalidate and process action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Revalidate and process action": {
+      "main": [
+        [
+          {
+            "node": "Record action outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record action outcome": {
+      "main": [
+        [
+          {
+            "node": "DT: Resolve case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Resolve case": {
+      "main": [
+        [
+          {
+            "node": "Slack: Replace case with outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Replace case with outcome": {
+      "main": [
+        [
+          {
+            "node": "Show action outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "k33dMa0HRqqRzbK1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  }
+}

@@ -55,7 +55,7 @@ select:focus-visible {
 
 main {
   min-height: 100vh;
-  max-width: 860px;
+  max-width: 1220px;
   margin: auto;
   padding: 26px 28px 32px;
   display: flex;
@@ -135,24 +135,9 @@ header {
 
 .text-button:hover { color: var(--ink); background: var(--card); border-color: var(--line); }
 
-.progress {
-  height: 4px;
-  width: min(100%, 560px);
-  margin-top: 30px;
-  border-radius: 99px;
-  background: rgba(255, 255, 255, 0.07);
-  overflow: hidden;
-}
-
-.progress i {
-  display: block;
-  width: 0;
-  height: 100%;
-  border-radius: 99px;
-  background: linear-gradient(90deg, #6a5df0, var(--accent));
-  box-shadow: 0 0 12px var(--accent-glow);
-  transition: width 0.35s ease;
-}
+.stage-tabs { display: flex; gap: 8px; width: 100%; margin-top: 24px; }
+.stage-tab { border: 1px solid var(--line); background: var(--card); color: var(--muted); border-radius: 7px; padding: 7px 10px; font: 11px var(--font-mono); cursor: pointer; }
+.stage-tab.active { color: var(--ink); border-color: var(--accent); background: rgba(124,134,255,.13); }
 
 .sync-status {
   height: 15px;
@@ -166,10 +151,15 @@ header {
   display: flex;
   flex-direction: column;
   align-items: center;
-  width: min(100%, 560px);
+  width: 100%;
   margin-top: 22px;
 }
 
+.workspace { width: 100%; display: grid; grid-template-columns: minmax(300px, .85fr) minmax(400px, 1fr); gap: 18px; }
+.website-pane { min-height: 540px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: var(--radius-lg); background: var(--card); display: grid; }
+.website-pane iframe { width: 100%; height: 100%; min-height: 540px; border: 0; background: white; }
+.website-empty { align-self: center; justify-self: center; text-align: center; padding: 24px; color: var(--muted); }
+.website-open { color: var(--accent); }
 .card-stack { width: 100%; height: 540px; position: relative; }
 
 .shadow-card {
@@ -726,8 +716,10 @@ button.sender-option:hover { background: var(--card-hover); border-color: var(--
   .rep-picker { grid-column: 1 / -1; grid-row: 2; justify-self: center; }
   .count { grid-column: 2; }
   .header-actions { grid-column: 3; }
-  .progress { margin-top: 20px; }
+  .stage-tabs { margin-top: 18px; overflow: auto; }
   .deck { width: min(100%, 480px); margin-top: 16px; }
+  .workspace { display: block; }
+  .website-pane { display: none; }
   .card-stack { height: 500px; }
   .action-rail { flex-direction: column-reverse; align-items: stretch; gap: 16px; margin-top: 22px; }
   .primary-group { justify-content: stretch; }

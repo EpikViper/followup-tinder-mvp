@@ -20,10 +20,10 @@
       <div class="count" id="count">00 / 00</div>
       <div class="header-actions"><button class="text-button" id="sync-button">Sync</button><button class="text-button" id="rules-button">Rules</button></div>
     </header>
-    <div class="progress" aria-label="Follow-up progress"><i id="progress-bar"></i></div>
+    <nav class="stage-tabs" id="stage-tabs" aria-label="Pipeline stages"></nav>
     <p class="sync-status" id="sync-status">Connecting to Attio…</p>
     <section class="deck" aria-live="polite">
-      <div class="card-stack"><div class="shadow-card"></div><article class="lead-card" id="lead-card"></article></div>
+      <div class="workspace"><aside class="website-pane" id="website-pane" aria-label="Company website"></aside><div class="card-stack"><div class="shadow-card"></div><article class="lead-card" id="lead-card"></article></div></div>
       <nav class="action-rail" aria-label="Company actions">
         <div class="dismiss-group">
           <button class="round not-qualified" id="not-qualified-button" title="Not qualified" aria-label="Not qualified"><span aria-hidden="true">×</span><small aria-hidden="true">Not qual</small></button>
@@ -61,14 +61,17 @@
     <div class="dialog-actions split-actions"><button class="secondary" id="composer-templates">Templates</button><button class="primary" id="send-linkedin">Send via SendPilot</button></div>
   </dialog>
 
-  <dialog id="email-dialog" class="standard-dialog">
+  <dialog id="email-dialog" class="composer-dialog">
     <button class="close" data-close="email-dialog" aria-label="Close">×</button>
-    <p class="eyebrow" id="email-composer-source">GMAIL COMPOSER</p><h2 id="email-composer-title">Email contact</h2>
+    <p class="eyebrow" id="email-composer-source">GMAIL · CHOOSE SENDER</p><h2 id="email-composer-title">Email contact</h2>
+    <div class="field-label"><span>Sending as</span><div class="sender-options" id="email-sender-options" role="group" aria-label="Choose Gmail sender"></div></div>
     <label class="field-label">To<input id="email-to" type="email" readonly></label>
-    <label class="field-label">Subject<input id="email-subject" maxlength="500" placeholder="Subject"></label>
+    <label class="field-label">CC<input id="email-cc" type="text" maxlength="1000" placeholder="name@example.com, name2@example.com"></label>
+    <section class="thread email-thread" id="email-thread" aria-label="Email conversation"></section>
+    <label class="field-label">Subject<input id="email-subject" maxlength="500" placeholder="Choose a sender first" disabled></label>
     <label class="field-label">Message<textarea id="email-message" rows="8" maxlength="5000" placeholder="Write your email…"></textarea></label>
-    <div class="dialog-actions split-actions"><button class="secondary" id="email-templates">Templates</button><button class="primary" id="launch-email-composer">Open in Gmail</button></div>
-    <p class="dialog-note">This opens a prefilled draft in a new browser tab. It does not send or complete the card.</p>
+    <div class="dialog-actions split-actions"><button class="secondary" id="email-templates">Templates</button><button class="primary" id="send-email" disabled>Choose a sender first</button></div>
+    <p class="dialog-note" id="email-mode-note">Choose the Gmail identity that should send this message.</p>
   </dialog>
 
   <dialog id="templates-dialog" class="standard-dialog templates-dialog">
@@ -90,6 +93,16 @@
     <label class="field-label">Direction<select id="repair-direction"><option value="Us">Contacted by us</option><option value="Them">Reply from them</option></select></label>
     <label class="field-label">Interaction date<input type="date" id="repair-date"></label>
     <button class="primary full-width" id="save-repair">Update Attio</button>
+  </dialog>
+
+  <dialog id="contact-dialog" class="standard-dialog">
+    <button class="close" data-close="contact-dialog" aria-label="Close">×</button>
+    <p class="eyebrow">ATTIO CONTACT</p><h2>Add responsible person</h2>
+    <label class="field-label">Full name<input id="contact-name" maxlength="200" required></label>
+    <label class="field-label">LinkedIn URL<input id="contact-linkedin" maxlength="500" placeholder="linkedin.com/in/…" required></label>
+    <label class="field-label">Email (optional)<input id="contact-email" type="email" maxlength="254"></label>
+    <label class="field-label">Phone (optional)<input id="contact-phone" maxlength="50"></label>
+    <button class="primary full-width" id="save-contact">Create contact</button>
   </dialog>
 
   <dialog id="confirm-dialog" class="standard-dialog confirm-dialog">

@@ -1,8 +1,9 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { AttioClient } from "./src/attio.js";
-import { QUEUE_LABELS, REPS, SYNC_INTERVAL_MS, TIME_ZONE } from "./src/constants.js";
+import { EMAIL_SENDERS, QUEUE_LABELS, REPS, SYNC_INTERVAL_MS, TIME_ZONE } from "./src/constants.js";
 import { GmailClient } from "./src/gmail.js";
 import { MockAttioClient, MockGmailClient, MockSendPilotClient, MockUnipileClient } from "./src/mock.js";
 import { addUnipileFallback, addUnipileFallbacks, routingChoices } from "./src/linkedin-routing.js";
@@ -12,6 +13,7 @@ import { LocalStore } from "./src/store.js";
 import { UnipileClient } from "./src/unipile.js";
 
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
+const EMAIL_AUTHORIZATION_TTL_MS = 15 * 60_000;
 
 function cleanText(value, maxLength) {
   const text = String(value ?? "").trim();
@@ -43,6 +45,19 @@ function normalizeEmail(value) {
   return email;
 }
 
+function normalizeEmails(value) {
+  if (value == null || value === "") return [];
+  if (!Array.isArray(value)) return null;
+  const emails = value.map(normalizeEmail);
+  if (emails.some((email) => !email)) return null;
+  return [...new Set(emails)];
+}
+
+function normalizeDomain(value) {
+  const raw = String(value || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
+  return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(raw) ? raw : null;
+}
+
 function publicError(error) {
   const message = error instanceof Error ? error.message : "Unexpected error";
   return message
@@ -53,8 +68,7 @@ function publicError(error) {
 
 export function createApp(options = {}) {
   const mock = options.mock ?? (process.argv.includes("--mock") || process.env.MOCK_MODE === "true");
-  const requestedEmailComposer = String(options.emailComposerProvider || process.env.EMAIL_COMPOSER_PROVIDER || "gmail").toLowerCase();
-  const emailComposerProvider = requestedEmailComposer === "outlook" ? "outlook" : "gmail";
+  const emailAuthorizationTtlMs = options.emailAuthorizationTtlMs ?? EMAIL_AUTHORIZATION_TTL_MS;
   const dataDir = options.dataDir || process.env.FOLLOWUP_DATA_DIR || path.join(projectDir, "data");
   const store = options.store || new LocalStore(path.resolve(projectDir, dataDir));
   const attio = options.attio || (mock ? new MockAttioClient() : new AttioClient());
@@ -62,6 +76,7 @@ export function createApp(options = {}) {
   const unipile = options.unipile || (mock ? new MockUnipileClient() : new UnipileClient());
   const gmail = options.gmail || (mock ? new MockGmailClient() : new GmailClient());
   const unipileAuthorizations = new Map();
+  const queueEmailMemberships = new Map();
   const emailAuthorizations = new Map();
   const app = express();
 
@@ -87,19 +102,32 @@ export function createApp(options = {}) {
     for (const [key, authorization] of unipileAuthorizations) {
       if (authorization.expiresAt <= now) unipileAuthorizations.delete(key);
     }
+    for (const [key, expiresAt] of queueEmailMemberships) {
+      if (expiresAt <= now) queueEmailMemberships.delete(key);
+    }
+    for (const [key, authorization] of emailAuthorizations) {
+      if (authorization.expiresAt <= now) emailAuthorizations.delete(key);
+    }
+  }
+
+  function emailMembershipKey(ownerId, entryId, personId, email) {
+    return [ownerId, entryId, personId, email].join(":");
   }
 
   function authorizeQueueEmails(ownerId, queue) {
     const prefix = `${ownerId}:`;
-    for (const key of emailAuthorizations.keys()) {
-      if (key.startsWith(prefix)) emailAuthorizations.delete(key);
+    for (const key of queueEmailMemberships.keys()) {
+      if (key.startsWith(prefix)) queueEmailMemberships.delete(key);
+    }
+    for (const [key, authorization] of emailAuthorizations) {
+      if (authorization.ownerId === ownerId) emailAuthorizations.delete(key);
     }
     const expiresAt = Date.now() + SYNC_INTERVAL_MS;
     for (const company of queue) {
       for (const contact of company.contacts || []) {
         for (const value of contact.emails || []) {
           const email = normalizeEmail(value);
-          if (email) emailAuthorizations.set(`${ownerId}:${email}`, expiresAt);
+          if (email) queueEmailMemberships.set(emailMembershipKey(ownerId, company.entryId, contact.id, email), expiresAt);
         }
       }
     }
@@ -110,7 +138,7 @@ export function createApp(options = {}) {
   app.use((req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "same-origin");
-    res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'");
+    res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; img-src 'self' data:; frame-src https:; frame-ancestors 'none'; base-uri 'none'");
     next();
   });
 
@@ -164,8 +192,8 @@ export function createApp(options = {}) {
       syncIntervalMs: SYNC_INTERVAL_MS,
       timeZone: TIME_ZONE,
       mode: mock ? "mock" : "live",
-      emailComposerProvider,
-      gmailThreadLookupEnabled: emailComposerProvider === "gmail" && gmail.configured,
+      emailSenders: EMAIL_SENDERS,
+      gmailSendAvailable: gmail.configured,
     });
   });
 
@@ -181,16 +209,105 @@ export function createApp(options = {}) {
   app.post("/api/email/resolve", async (req, res, next) => {
     try {
       const ownerId = cleanText(req.body.ownerId, 100);
+      const entryId = cleanText(req.body.entryId, 100);
+      const personId = cleanText(req.body.personId, 100);
       const email = normalizeEmail(req.body.email);
-      if (!ownerId || !validRep(ownerId) || !email) {
-        return res.status(400).json({ error: "A valid queue owner and contact email are required" });
+      const senderId = cleanText(req.body.senderId, 254);
+      const cc = normalizeEmails(req.body.cc);
+      const sender = EMAIL_SENDERS.find((item) => item.id === senderId);
+      if (!ownerId || !validRep(ownerId) || !entryId || !personId || !email || !sender || !cc || cc.includes(email) || cc.includes(sender.email)) {
+        return res.status(400).json({ error: "A valid queue contact, recipient, and allowlisted email sender are required" });
       }
-      const expiresAt = emailAuthorizations.get(`${ownerId}:${email}`);
+      if (!gmail.configured) return res.status(503).json({ error: "Gmail sending is not configured" });
+      cleanAuthorizations();
+      const expiresAt = queueEmailMemberships.get(emailMembershipKey(ownerId, entryId, personId, email));
       if (!expiresAt || expiresAt <= Date.now()) {
-        return res.status(409).json({ error: "Sync the queue before looking up this email thread" });
+        return res.status(409).json({ error: "Sync the queue before resolving this contact email" });
       }
-      res.json(await gmail.findLatestThread({ ownerId, email }));
+      const resolved = await gmail.resolveThread({ mailbox: sender.email, email, cc });
+      const authorizationId = randomUUID();
+      const authorizationExpiresAt = Math.min(expiresAt, Date.now() + emailAuthorizationTtlMs);
+      emailAuthorizations.set(authorizationId, {
+        ownerId,
+        entryId,
+        personId,
+        email,
+        mailbox: sender.email,
+        senderId: sender.id,
+        cc,
+        mode: resolved.mode,
+        threadId: resolved.threadId || null,
+        expiresAt: authorizationExpiresAt,
+      });
+      res.json({
+        authorizationId,
+        expiresAt: new Date(authorizationExpiresAt).toISOString(),
+        mode: resolved.mode,
+        subject: resolved.subject || "",
+        sender,
+        thread: resolved.found ? { id: resolved.threadId, lastMessageAt: resolved.lastMessageAt } : null,
+        messages: resolved.messages || [],
+      });
     } catch (error) { next(error); }
+  });
+
+  app.post("/api/email/send", async (req, res, next) => {
+    const authorizationId = cleanText(req.body.authorizationId, 100);
+    const idempotencyKey = cleanText(req.body.idempotencyKey, 100);
+    const ownerId = cleanText(req.body.ownerId, 100);
+    const entryId = cleanText(req.body.entryId, 100);
+    const personId = cleanText(req.body.personId, 100);
+    const subject = cleanText(req.body.subject, 500);
+    const message = cleanText(req.body.message, 5000);
+    if (!authorizationId || !idempotencyKey || !ownerId || !entryId || !personId || !message) {
+      return res.status(400).json({ error: "Email authorization, queue contact, message, and idempotency key are required" });
+    }
+    cleanAuthorizations();
+    const authorization = emailAuthorizations.get(authorizationId);
+    if (!authorization || authorization.expiresAt <= Date.now()) {
+      return res.status(409).json({ error: "This email authorization expired. Choose the sender again." });
+    }
+    const cc = normalizeEmails(req.body.cc);
+    if (!cc || JSON.stringify(cc) !== JSON.stringify(authorization.cc) || authorization.ownerId !== ownerId || authorization.entryId !== entryId || authorization.personId !== personId) {
+      return res.status(409).json({ error: "This email authorization does not match the current queue contact" });
+    }
+    const membership = queueEmailMemberships.get(emailMembershipKey(ownerId, entryId, personId, authorization.email));
+    if (!membership || membership <= Date.now()) {
+      return res.status(409).json({ error: "This contact is no longer authorized by the synchronized queue" });
+    }
+    if (authorization.mode === "new" && (!subject || /[\r\n]/.test(subject))) {
+      return res.status(400).json({ error: "A subject is required for a new email" });
+    }
+
+    const started = store.beginSend({
+      idempotencyKey,
+      entryId,
+      personId,
+      accountId: authorization.mailbox,
+      chatId: authorization.threadId,
+      text: message,
+    });
+    if (!started.created) {
+      if (started.receipt.status === "sent") return res.json({ ok: true, provider: "gmail", duplicate: true, receipt: started.receipt });
+      return res.status(409).json({ error: `This send is already ${started.receipt.status}. Choose Send again to make a deliberate new attempt.` });
+    }
+
+    try {
+      const sent = await gmail.sendEmail({
+        mailbox: authorization.mailbox,
+        email: authorization.email,
+        subject,
+        body: message,
+        cc: authorization.cc,
+        reply: authorization.mode === "reply",
+      });
+      const receipt = store.completeSend(idempotencyKey, { providerMessageId: sent.messageId, chatId: sent.threadId });
+      if (mock && typeof attio.simulateOutbound === "function") attio.simulateOutbound(personId);
+      res.json({ ok: true, provider: "gmail", duplicate: false, receipt });
+    } catch (error) {
+      store.failSend(idempotencyKey, publicError(error));
+      next(error);
+    }
   });
 
   app.get("/api/companies/:companyId/notes", async (req, res, next) => {
@@ -204,6 +321,50 @@ export function createApp(options = {}) {
       const url = normalizeLinkedinUrl(req.body.url);
       await attio.updatePersonLinkedin(req.params.personId, url);
       res.json({ ok: true, url });
+    } catch (error) { next(error); }
+  });
+
+  app.patch("/api/people/:personId/phones", async (req, res, next) => {
+    try {
+      const phones = Array.isArray(req.body.phones) ? req.body.phones.map((phone) => cleanText(phone, 50)) : null;
+      if (!phones || phones.some((phone) => !phone)) return res.status(400).json({ error: "Enter valid phone numbers" });
+      await attio.updatePersonPhones(req.params.personId, phones);
+      res.json({ ok: true, phones });
+    } catch (error) { next(error); }
+  });
+
+  app.patch("/api/people/:personId/emails", async (req, res, next) => {
+    try {
+      const emails = normalizeEmails(req.body.emails);
+      if (!emails || !emails.length) return res.status(400).json({ error: "Enter at least one valid email address" });
+      await attio.updatePersonEmails(req.params.personId, emails);
+      res.json({ ok: true, emails });
+    } catch (error) {
+      if (/uniqueness_conflict|email_addresses.*conflicts/i.test(String(error?.message || error))) {
+        return res.status(409).json({ error: "This email already belongs to another Attio person. It was not moved; merge the duplicate or link that existing person deliberately." });
+      }
+      next(error);
+    }
+  });
+
+  app.patch("/api/companies/:companyId/domains", async (req, res, next) => {
+    try {
+      const domains = Array.isArray(req.body.domains) ? req.body.domains.map(normalizeDomain) : null;
+      if (!domains || domains.some((domain) => !domain)) return res.status(400).json({ error: "Enter valid domains" });
+      await attio.updateCompanyDomains(req.params.companyId, domains);
+      res.json({ ok: true, domains: [...new Set(domains)] });
+    } catch (error) { next(error); }
+  });
+
+  app.post("/api/companies/:companyId/people", async (req, res, next) => {
+    try {
+      const name = cleanText(req.body.name, 200);
+      const linkedinUrl = normalizeLinkedinUrl(req.body.linkedinUrl);
+      const email = req.body.email ? normalizeEmail(req.body.email) : null;
+      const phone = req.body.phone ? cleanText(req.body.phone, 50) : null;
+      if (!name || (req.body.email && !email) || (req.body.phone && !phone)) return res.status(400).json({ error: "Name, LinkedIn URL, and optional contact details are invalid" });
+      const created = await attio.createPerson({ companyId: req.params.companyId, name, linkedinUrl, email, phone });
+      res.status(201).json({ ok: true, personId: created?.data?.id?.record_id || created?.id?.record_id || null });
     } catch (error) { next(error); }
   });
 
@@ -362,6 +523,7 @@ export function createApp(options = {}) {
       unipile.reset?.();
       gmail.reset?.();
       unipileAuthorizations.clear();
+      queueEmailMemberships.clear();
       emailAuthorizations.clear();
       res.json({ ok: true });
     });

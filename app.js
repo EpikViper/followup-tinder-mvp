@@ -8,10 +8,15 @@ const state = {
   templates: [],
   templateTarget: "copy",
   sendpilotRoute: null,
+  emailDraft: null,
   syncing: false,
   syncTimer: null,
   noteRequest: 0,
+  activeStage: "Unprocessed",
+  stageQueues: new Map(),
+  stageHistories: new Map(),
 };
+const STAGES = ["Unprocessed", "Qualified", "Meeting Booked"];
 
 const $ = (selector) => document.querySelector(selector);
 const card = $("#lead-card");
@@ -94,18 +99,38 @@ function todayTbilisi() {
 
 function setActions(enabled) {
   for (const button of document.querySelectorAll(".action-rail button")) button.disabled = !enabled;
-  $("#previous-button").disabled = !enabled || state.navigationHistory.length === 0;
+  $("#previous-button").disabled = !enabled || history().length === 0;
   $("#next-button").disabled = !enabled || state.queue.length < 2;
+}
+
+function history() { return state.stageHistories.get(state.activeStage) || []; }
+function setHistory(value) { state.stageHistories.set(state.activeStage, value); }
+function renderStageTabs() {
+  const root = $("#stage-tabs");
+  root.innerHTML = STAGES.map((stage) => `<button class="stage-tab ${stage === state.activeStage ? "active" : ""}" data-stage="${stage}">${escapeHtml(stage)} <span>${state.stageQueues.get(stage)?.length || 0}</span></button>`).join("");
+  root.querySelectorAll("button").forEach((button) => button.onclick = () => {
+    state.stageQueues.set(state.activeStage, state.queue);
+    state.activeStage = button.dataset.stage;
+    state.queue = state.stageQueues.get(state.activeStage) || [];
+    render();
+  });
+}
+
+function renderWebsite(company) {
+  const pane = $("#website-pane");
+  const domain = company?.domains?.[0];
+  if (!domain) { pane.innerHTML = '<div class="website-empty"><strong>No company domain</strong><p>Add a domain from the card to load the website here.</p></div>'; return; }
+  const url = `https://${domain}`;
+  pane.innerHTML = `<iframe title="${escapeHtml(company.companyName)} website" src="${escapeHtml(url)}"></iframe><div class="website-empty"><a class="website-open" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">Open website ↗</a></div>`;
 }
 
 function render() {
   const company = current();
-  const completed = state.completedIds.size;
-  const total = completed + state.queue.length;
-  const progress = total ? (completed / total) * 100 : 100;
-  $("#progress-bar").style.width = `${progress}%`;
+  const total = state.queue.length;
+  renderStageTabs();
 
   if (!company) {
+    renderWebsite(null);
     $("#count").textContent = state.syncing ? "…" : "DONE";
     setActions(false);
     card.innerHTML = state.syncing
@@ -115,26 +140,27 @@ function render() {
   }
 
   setActions(true);
-  const ordinal = Math.min(completed + 1, total);
+  const ordinal = Math.min(history().length + 1, total);
   $("#count").textContent = `${String(ordinal).padStart(2, "0")} / ${String(total).padStart(2, "0")}`;
   const contact = selectedContact(company);
+  renderWebsite(company);
   const domain = company.domains?.[0] || null;
   const contactControl = company.contacts.length > 1
     ? `<select class="contact-select" id="contact-select" aria-label="Select contact">${company.contacts.map((person) => `<option value="${escapeHtml(person.id)}" ${person.id === contact?.id ? "selected" : ""}>${escapeHtml(person.name)}</option>`).join("")}</select>`
-    : `<strong>${escapeHtml(contact?.name || "No associated contact")}</strong>`;
+    : contact
+      ? `<strong>${escapeHtml(contact.name)}</strong>`
+      : `<strong>No associated contact</strong><button class="inline-link" id="add-contact">+ Add contact</button>`;
   const linkedin = contact?.linkedinUrl
     ? `<a href="${escapeHtml(contact.linkedinUrl)}" target="_blank" rel="noreferrer">LinkedIn →</a>`
     : contact
       ? '<button class="inline-link" id="add-linkedin">+ Add LinkedIn URL</button>'
       : "";
-  const emails = company.contacts.flatMap((person) =>
-    (person.emails || []).map((email) => ({ email, name: person.name }))
-  );
+  const emails = (contact?.emails || []).map((email) => ({ email, name: contact.name, personId: contact.id }));
 
   card.innerHTML = `<div class="contact-card">
     <div class="company-line">
       <div><p class="queue-label">${escapeHtml(company.queueLabel)}</p><h2>${escapeHtml(company.companyName)}</h2></div>
-      ${domain ? `<a class="domain-link" href="https://${escapeHtml(domain)}" target="_blank" rel="noreferrer">${escapeHtml(domain)} ↗</a>` : '<span class="domain-link">No domain</span>'}
+      ${domain ? `<a class="domain-link" href="https://${escapeHtml(domain)}" target="_blank" rel="noreferrer">${escapeHtml(domain)} ↗</a>` : '<button class="inline-link" id="add-domain">+ Add domain</button>'}
     </div>
     <div class="contact-line">
       <span class="section-label">CONTACT</span>
@@ -143,8 +169,9 @@ function render() {
     </div>
     <div class="email-section">
       <span class="section-label">EMAILS</span>
-      <div class="email-list">${emails.length ? emails.map((item) => `<div class="email-row"><button class="inline-email" data-email="${escapeHtml(item.email)}" data-name="${escapeHtml(item.name)}">${escapeHtml(item.email)}</button><span>${escapeHtml(item.name)}</span></div>`).join("") : '<span class="empty-note">No associated email addresses</span>'}</div>
+      <div class="email-list">${emails.length ? emails.map((item) => `<div class="email-row"><button class="inline-email" data-email="${escapeHtml(item.email)}" data-name="${escapeHtml(item.name)}" data-person-id="${escapeHtml(item.personId)}">${escapeHtml(item.email)}</button><span>${escapeHtml(item.name)}</span></div>`).join("") : '<span class="empty-note">No email addresses for this contact</span>'}${contact ? `<button class="inline-link" id="edit-emails">${emails.length ? "Edit emails" : "+ Add email"}</button>` : ''}<div id="email-editor"></div></div>
     </div>
+    <div class="email-section"><span class="section-label">PHONE</span><div class="email-list">${contact?.phones?.length ? `${escapeHtml(contact.phones.join(", "))} <button class="inline-link" id="edit-phones">Edit</button>` : contact ? '<button class="inline-link" id="edit-phones">+ Add phone</button>' : '<span class="empty-note">Add a contact first</span>'}</div></div>
     <section class="context">
       <div class="context-heading"><span class="section-label">ATTIO NOTES</span><button id="fix-interaction">Fix interaction</button></div>
       <div id="notes"><p class="empty-note">Loading notes…</p></div>
@@ -159,8 +186,12 @@ function render() {
     render();
   });
   $("#add-linkedin")?.addEventListener("click", showLinkedinEditor);
+  $("#add-domain")?.addEventListener("click", editDomain);
+  $("#add-contact")?.addEventListener("click", () => $("#contact-dialog").showModal());
+  $("#edit-phones")?.addEventListener("click", editPhones);
+  $("#edit-emails")?.addEventListener("click", showEmailEditor);
   for (const button of document.querySelectorAll(".inline-email")) {
-    button.addEventListener("click", () => openEmail(button.dataset.email, button.dataset.name));
+    button.addEventListener("click", () => openEmail(button.dataset.email, button.dataset.name, button.dataset.personId));
   }
   $("#fix-interaction")?.addEventListener("click", openRepair);
   loadNotes(company);
@@ -208,6 +239,69 @@ async function saveLinkedin() {
   }
 }
 
+async function editDomain() {
+  const company = current();
+  if (!company) return;
+  const value = window.prompt("Company domain", company.domains?.join(", ") || "");
+  if (value == null) return;
+  const domains = value.split(",").map((domain) => domain.trim()).filter(Boolean);
+  if (!domains.length) return toast("Enter at least one domain");
+  try {
+    const result = await api(`/api/companies/${encodeURIComponent(company.companyId)}/domains`, { method: "PATCH", body: JSON.stringify({ domains }) });
+    company.domains = result.domains;
+    render();
+  } catch (error) { toast(error.message); }
+}
+
+async function editPhones() {
+  const contact = selectedContact();
+  if (!contact) return;
+  const value = window.prompt("Phone numbers (comma-separated)", (contact.phones || []).join(", "));
+  if (value == null) return;
+  const phones = value.split(",").map((phone) => phone.trim()).filter(Boolean);
+  if (!phones.length) return toast("Enter at least one phone number");
+  try {
+    const result = await api(`/api/people/${encodeURIComponent(contact.id)}/phones`, { method: "PATCH", body: JSON.stringify({ phones }) });
+    contact.phones = result.phones;
+    render();
+  } catch (error) { toast(error.message); }
+}
+
+function showEmailEditor() {
+  const contact = selectedContact();
+  if (!contact) return;
+  const editor = $("#email-editor");
+  editor.innerHTML = `<div class="linkedin-editor"><input id="emails-input" type="text" value="${escapeHtml((contact.emails || []).join(", "))}" placeholder="name@example.com, name2@example.com" aria-label="Email addresses"><button class="mini-button" id="save-emails">Save</button></div>`;
+  $("#emails-input").focus();
+  $("#save-emails").onclick = saveEmails;
+}
+
+async function saveEmails() {
+  const contact = selectedContact();
+  if (!contact) return;
+  const emails = $("#emails-input").value.split(",").map((email) => email.trim()).filter(Boolean);
+  if (!emails.length) return toast("Enter at least one email address");
+  try {
+    const result = await api(`/api/people/${encodeURIComponent(contact.id)}/emails`, { method: "PATCH", body: JSON.stringify({ emails }) });
+    contact.emails = result.emails;
+    render();
+  } catch (error) { toast(error.message); }
+}
+
+async function createContact() {
+  const company = current();
+  if (!company) return;
+  const button = $("#save-contact"); button.disabled = true;
+  try {
+    await api(`/api/companies/${encodeURIComponent(company.companyId)}/people`, { method: "POST", body: JSON.stringify({
+      name: $("#contact-name").value, linkedinUrl: $("#contact-linkedin").value, email: $("#contact-email").value, phone: $("#contact-phone").value,
+    }) });
+    $("#contact-dialog").close();
+    await syncQueue();
+    toast("Contact created and associated in Attio");
+  } catch (error) { toast(error.message); } finally { button.disabled = false; }
+}
+
 async function syncQueue({ quiet = false } = {}) {
   if (state.syncing) return;
   state.syncing = true;
@@ -219,6 +313,7 @@ async function syncQueue({ quiet = false } = {}) {
       state.sessionOwner = ownerId;
       state.completedIds.clear();
       state.navigationHistory.length = 0;
+      state.stageHistories.clear();
     }
     const oldIds = new Set(state.queue.map((company) => company.entryId));
     const currentId = current()?.entryId;
@@ -237,7 +332,9 @@ async function syncQueue({ quiet = false } = {}) {
       const currentIndex = nextQueue.findIndex((company) => company.entryId === currentId);
       if (currentIndex > 0) nextQueue.unshift(...nextQueue.splice(currentIndex, 1));
     }
-    state.queue = nextQueue;
+    state.stageQueues = new Map(STAGES.map((stage) => [stage, nextQueue.filter((company) => company.stage === stage)]));
+    state.stageHistories = new Map(STAGES.map((stage) => [stage, (state.stageHistories.get(stage) || []).filter((id) => state.stageQueues.get(stage).some((company) => company.entryId === id))]));
+    state.queue = state.stageQueues.get(state.activeStage) || [];
     $("#sync-status").textContent = `Synced ${new Date(result.syncedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
   } catch (error) {
     $("#sync-status").textContent = "Sync failed";
@@ -253,6 +350,12 @@ function completeCurrent(message) {
   if (company) {
     state.completedIds.add(company.entryId);
     state.navigationHistory = state.navigationHistory.filter((entryId) => entryId !== company.entryId);
+    setHistory(history().filter((entryId) => entryId !== company.entryId));
+    state.stageQueues.set(state.activeStage, state.queue);
+    if (!state.queue.length) {
+      const nextStage = STAGES.find((stage) => (state.stageQueues.get(stage) || []).length);
+      if (nextStage) { state.activeStage = nextStage; state.queue = state.stageQueues.get(nextStage); }
+    }
   }
   toast(message);
   render();
@@ -262,16 +365,20 @@ function navigateForward() {
   if (state.queue.length < 2) return;
   const company = state.queue.shift();
   state.queue.push(company);
-  state.navigationHistory.push(company.entryId);
+  setHistory([...history(), company.entryId]);
+  state.stageQueues.set(state.activeStage, state.queue);
   render();
 }
 
 function navigateBackward() {
-  while (state.navigationHistory.length) {
-    const entryId = state.navigationHistory.pop();
+  const entries = history();
+  while (entries.length) {
+    const entryId = entries.pop();
     const index = state.queue.findIndex((company) => company.entryId === entryId);
     if (index < 0) continue;
     state.queue.unshift(...state.queue.splice(index, 1));
+    setHistory(entries);
+    state.stageQueues.set(state.activeStage, state.queue);
     render();
     return;
   }
@@ -439,85 +546,192 @@ async function sendLinkedin() {
   }
 }
 
-function emailProvider() {
-  return state.config?.emailComposerProvider === "outlook" ? "outlook" : "gmail";
+function renderEmailSenders() {
+  const container = $("#email-sender-options");
+  const selectedId = state.emailDraft?.senderId;
+  container.innerHTML = (state.config?.emailSenders || []).map((sender) =>
+    `<button type="button" class="sender-option ${sender.id === selectedId ? "selected" : ""}" data-sender-id="${escapeHtml(sender.id)}" aria-pressed="${sender.id === selectedId}"><strong>${escapeHtml(sender.name)}</strong><span>${escapeHtml(sender.email)}</span></button>`
+  ).join("");
+  for (const button of container.querySelectorAll(".sender-option")) {
+    button.onclick = () => resolveEmailSender(button.dataset.senderId);
+  }
 }
 
-function showEmailComposer(email, name) {
-  const contact = selectedContact();
-  const provider = emailProvider();
-  $("#email-composer-source").textContent = `${provider.toUpperCase()} COMPOSER`;
-  $("#email-composer-title").textContent = `Email ${name || contact?.name || "contact"}`;
-  $("#email-to").value = email;
-  $("#email-subject").value = "";
-  $("#email-message").value = "";
-  $("#launch-email-composer").textContent = `Open in ${provider === "outlook" ? "Outlook" : "Gmail"}`;
-  $("#email-dialog").showModal();
-  $("#email-subject").focus();
-}
-
-async function openEmail(emailOverride = null, nameOverride = null) {
-  const contact = selectedContact();
-  const email = typeof emailOverride === "string" ? emailOverride : contact?.emails?.[0];
-  if (!email) return toast("This contact has no email address");
-  if (emailProvider() !== "gmail" || !state.config?.gmailThreadLookupEnabled) {
-    showEmailComposer(email, nameOverride);
+function renderEmailThread(messages = []) {
+  const thread = $("#email-thread");
+  if (!messages.length) {
+    thread.innerHTML = '<p class="empty-note">No existing conversation from this mailbox. This will be a new email.</p>';
     return;
   }
+  thread.innerHTML = messages.map((message) =>
+    `<div class="message-bubble ${message.isSender ? "ours" : "theirs"}">${escapeHtml(message.text || "No plain-text preview available")}<time>${escapeHtml(formatDate(message.sentAt))}</time></div>`
+  ).join("");
+  thread.scrollTop = thread.scrollHeight;
+}
 
-  // Reserve a tab while the click is still a direct user gesture, otherwise the
-  // browser may block it after the asynchronous Gmail lookup finishes.
-  const tab = window.open("about:blank", "_blank");
-  if (tab) {
-    tab.opener = null;
-    tab.document.title = "Checking Gmail…";
-    tab.document.body.textContent = "Checking for an existing email thread…";
+function updateEmailSendState() {
+  const draft = state.emailDraft;
+  const button = $("#send-email");
+  if (!draft?.authorizationId || draft.resolving || draft.sending) {
+    button.disabled = true;
+    if (!draft?.sending) button.textContent = draft?.resolving ? "Checking Gmail…" : "Choose a sender first";
+    return;
   }
-  toast("Checking Gmail for an existing thread…");
+  const hasBody = Boolean($("#email-message").value.trim());
+  const hasSubject = draft.mode === "reply" || Boolean($("#email-subject").value.trim());
+  button.disabled = !hasBody || !hasSubject;
+  button.textContent = draft.mode === "reply" ? "Send reply" : "Send email";
+}
+
+function emailCc() {
+  const raw = $("#email-cc").value.trim();
+  if (!raw) return [];
+  const values = raw.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
+  return values.every((value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) ? [...new Set(values)] : null;
+}
+
+function openEmail(emailOverride = null, nameOverride = null, personIdOverride = null) {
+  const company = current();
+  const contact = personIdOverride
+    ? company?.contacts?.find((person) => person.id === personIdOverride)
+    : selectedContact(company);
+  const email = typeof emailOverride === "string" ? emailOverride : contact?.emails?.[0];
+  if (!company || !contact || !email) return toast("This contact has no email address");
+
+  state.emailDraft = {
+    ownerId: state.sessionOwner,
+    entryId: company.entryId,
+    personId: contact.id,
+    email,
+    name: nameOverride || contact.name,
+    senderId: null,
+    authorizationId: null,
+    mode: null,
+    newSubject: "",
+    resolving: false,
+    sending: false,
+    version: 0,
+  };
+  $("#email-composer-source").textContent = "GMAIL · CHOOSE SENDER";
+  $("#email-composer-title").textContent = `Email ${state.emailDraft.name || "contact"}`;
+  $("#email-to").value = email;
+  $("#email-cc").value = "";
+  $("#email-subject").value = "";
+  $("#email-subject").disabled = true;
+  $("#email-subject").readOnly = false;
+  $("#email-subject").required = false;
+  $("#email-subject").placeholder = "Choose a sender first";
+  $("#email-message").value = "";
+  $("#email-thread").innerHTML = '<p class="empty-note">Choose a sender to check for an existing conversation.</p>';
+  $("#email-mode-note").textContent = state.config?.gmailSendAvailable
+    ? "Choose the Gmail identity that should send this message."
+    : "Gmail sending is not configured on this server.";
+  renderEmailSenders();
+  $("#email-dialog").showModal();
+  updateEmailSendState();
+  $("#email-message").focus();
+}
+
+async function resolveEmailSender(senderId) {
+  const draft = state.emailDraft;
+  if (!draft || !state.config?.gmailSendAvailable) return toast("Gmail sending is not configured");
+  if (draft.mode === "new") draft.newSubject = $("#email-subject").value;
+  draft.senderId = senderId;
+  const cc = emailCc();
+  if (!cc) return toast("Enter valid comma-separated CC addresses");
+  draft.authorizationId = null;
+  draft.resolving = true;
+  const version = ++draft.version;
+  renderEmailSenders();
+  $("#email-composer-source").textContent = "GMAIL · CHECKING CONVERSATION";
+  $("#email-thread").innerHTML = '<p class="empty-note">Loading recent email messages…</p>';
+  $("#email-mode-note").textContent = "Resolving this sender and recipient in Gmail…";
+  $("#email-subject").disabled = true;
+  updateEmailSendState();
   try {
     const result = await api("/api/email/resolve", {
       method: "POST",
-      body: JSON.stringify({ ownerId: state.sessionOwner, email }),
+      body: JSON.stringify({
+        ownerId: draft.ownerId,
+        entryId: draft.entryId,
+        personId: draft.personId,
+        email: draft.email,
+        cc,
+        senderId,
+      }),
     });
-    if (result.found && result.url) {
-      if (tab) tab.location.replace(result.url);
-      else window.location.assign(result.url);
-      toast(`Existing thread opened in ${result.mailbox} · reply in Gmail`);
-      return;
+    if (state.emailDraft !== draft || version !== draft.version) return;
+    draft.authorizationId = result.authorizationId;
+    draft.mode = result.mode;
+    draft.resolving = false;
+    if (result.mode === "reply") {
+      $("#email-composer-source").textContent = "GMAIL · REPLY";
+      $("#email-subject").value = result.subject;
+      $("#email-subject").readOnly = true;
+      $("#email-subject").disabled = false;
+      $("#email-subject").required = false;
+      $("#email-mode-note").textContent = "Replying in the existing thread. Gmail will revalidate it immediately before sending.";
+    } else {
+      $("#email-composer-source").textContent = "GMAIL · NEW EMAIL";
+      $("#email-subject").value = draft.newSubject;
+      $("#email-subject").readOnly = false;
+      $("#email-subject").disabled = false;
+      $("#email-subject").required = true;
+      $("#email-subject").placeholder = "Subject";
+      $("#email-mode-note").textContent = "No existing conversation found. Add a subject to send a new email.";
     }
-    tab?.close();
-    showEmailComposer(email, nameOverride);
+    renderEmailThread(result.messages);
   } catch (error) {
-    tab?.close();
-    showEmailComposer(email, nameOverride);
-    toast(`${error.message} · you can still open a new draft`);
+    if (state.emailDraft !== draft || version !== draft.version) return;
+    draft.resolving = false;
+    draft.mode = null;
+    $("#email-composer-source").textContent = "GMAIL · SENDER UNAVAILABLE";
+    $("#email-thread").innerHTML = `<p class="empty-note">${escapeHtml(error.message)}</p>`;
+    $("#email-mode-note").textContent = "Choose this sender again or select another mailbox. Nothing was sent.";
+    toast(error.message);
+  } finally {
+    if (state.emailDraft === draft && version === draft.version) updateEmailSendState();
   }
 }
 
-function launchEmailComposer() {
-  const provider = emailProvider();
-  const to = $("#email-to").value.trim();
-  const subject = $("#email-subject").value;
-  const body = $("#email-message").value;
-  if (!to) return toast("Choose an email address");
+async function sendEmail() {
+  const draft = state.emailDraft;
+  if (!draft?.authorizationId || draft.resolving || draft.sending) return;
+  const subject = $("#email-subject").value.trim();
+  const message = $("#email-message").value.trim();
+  if (!message) return toast("Write a message first");
+  if (draft.mode === "new" && !subject) return toast("Add a subject for this new email");
 
-  const url = provider === "outlook"
-    ? new URL("https://outlook.office.com/mail/deeplink/compose")
-    : new URL("https://mail.google.com/mail/");
-  if (provider === "gmail") {
-    url.searchParams.set("view", "cm");
-    url.searchParams.set("fs", "1");
-    url.searchParams.set("to", to);
-    if (subject) url.searchParams.set("su", subject);
-  } else {
-    url.searchParams.set("to", to);
-    if (subject) url.searchParams.set("subject", subject);
+  const button = $("#send-email");
+  draft.sending = true;
+  button.disabled = true;
+  button.textContent = "Sending…";
+  try {
+    await api("/api/email/send", {
+      method: "POST",
+      body: JSON.stringify({
+        authorizationId: draft.authorizationId,
+        idempotencyKey: crypto.randomUUID(),
+        ownerId: draft.ownerId,
+        entryId: draft.entryId,
+        personId: draft.personId,
+        subject,
+        message,
+        cc: emailCc() || [],
+      }),
+    });
+    $("#email-dialog").close();
+    state.emailDraft = null;
+    completeCurrent("Sent via Gmail · Attio sync pending");
+  } catch (error) {
+    toast(`${error.message} No automatic resend was attempted.`);
+    $("#email-mode-note").textContent = "Delivery failed. Your message is unchanged; use Send again only when you are ready to retry.";
+  } finally {
+    if (state.emailDraft === draft) {
+      draft.sending = false;
+      updateEmailSendState();
+    }
   }
-  if (body) url.searchParams.set("body", body);
-
-  window.open(url.toString(), "_blank", "noopener,noreferrer");
-  $("#email-dialog").close();
-  toast(`Draft opened in ${provider === "outlook" ? "Outlook" : "Gmail"} · card stays in queue`);
 }
 
 async function loadTemplates() {
@@ -544,6 +758,7 @@ function renderTemplates() {
       const target = state.templateTarget === "email" ? $("#email-message") : $("#message-text");
       target.value = template.body;
       $("#templates-dialog").close();
+      if (state.templateTarget === "email") updateEmailSendState();
       target.focus();
     });
     item.querySelector(".copy-template").onclick = () => copyText(template.body);
@@ -694,6 +909,8 @@ $("#rep-select").addEventListener("change", async () => {
   state.queue = [];
   state.completedIds.clear();
   state.sessionOwner = null;
+  state.stageQueues.clear();
+  state.stageHistories.clear();
   await syncQueue();
   scheduleNextSync();
 });
@@ -705,7 +922,10 @@ $("#rules-button").onclick = () => $("#rules-dialog").showModal();
 $("#linkedin-button").onclick = openComposer;
 $("#email-button").onclick = () => openEmail();
 $("#email-templates").onclick = () => openTemplates("email");
-$("#launch-email-composer").onclick = launchEmailComposer;
+$("#send-email").onclick = sendEmail;
+$("#email-message").addEventListener("input", updateEmailSendState);
+$("#email-subject").addEventListener("input", updateEmailSendState);
+$("#email-cc").addEventListener("change", () => { if (state.emailDraft?.senderId) resolveEmailSender(state.emailDraft.senderId); });
 $("#templates-button").onclick = () => openTemplates("copy");
 $("#not-qualified-button").onclick = askNotQualified;
 $("#lost-button").onclick = askLost;
@@ -717,10 +937,17 @@ $("#add-template-button").onclick = () => showTemplateForm();
 $("#cancel-template").onclick = () => $("#template-form").classList.add("hidden");
 $("#template-form").onsubmit = saveTemplate;
 $("#save-repair").onclick = saveRepair;
+$("#save-contact").onclick = createContact;
 $("#confirm-not-qualified").onclick = markNotQualified;
 $("#confirm-lost").onclick = markLost;
 for (const button of document.querySelectorAll("[data-close]")) {
-  button.addEventListener("click", () => $(`#${button.dataset.close}`).close());
+  button.addEventListener("click", () => {
+    $(`#${button.dataset.close}`).close();
+    if (button.dataset.close === "email-dialog") {
+      if (state.emailDraft) state.emailDraft.version += 1;
+      state.emailDraft = null;
+    }
+  });
 }
 document.addEventListener("keydown", (event) => {
   if ($("dialog[open]") || event.metaKey || event.ctrlKey || event.altKey) return;

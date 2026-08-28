@@ -15,7 +15,7 @@ test("rep completes the core follow-up workflow", async ({ page }) => {
   });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Oyster" })).toBeVisible();
-  await expect(page.locator("#count")).toHaveText("01 / 04");
+  await expect(page.locator("#count")).toHaveText("01 / 01");
   await expect(page.getByText("THEY REPLIED")).not.toBeVisible();
 
   await page.getByRole("button", { name: "Templates" }).click();
@@ -34,6 +34,7 @@ test("rep completes the core follow-up workflow", async ({ page }) => {
   await page.getByRole("button", { name: "Use" }).click();
   await expect(page.locator("#message-text")).toHaveValue("Happy to send the short version here.");
   await page.locator("#send-linkedin").click();
+  await page.getByRole("button", { name: /Qualified/ }).click();
   await expect(page.getByRole("heading", { name: "Vanta" })).toBeVisible();
 
   await page.getByRole("button", { name: /Not qualified/ }).click();
@@ -123,48 +124,65 @@ test("a verified Unipile fallback sends through the existing conversation", asyn
   await expect(page.getByRole("heading", { name: "Oyster" })).toBeVisible();
 });
 
-test("email opens a prefilled Gmail draft and can use a saved template", async ({ page, request, context }) => {
+test("email requires an explicit sender and sends a template as new mail", async ({ page, request }) => {
   await request.post("/api/templates", {
     data: { name: "Short email", body: "Happy to send the short version." },
-  });
-  await context.route("https://mail.google.com/**", async (route) => {
-    await route.fulfill({ contentType: "text/html", body: "<title>Gmail draft</title>" });
   });
 
   await page.goto("/");
   await page.locator("#contact-select").selectOption("person-jules");
   await page.getByRole("button", { name: /Compose email/ }).click();
-  await expect(page.getByRole("dialog").filter({ hasText: "GMAIL COMPOSER" })).toBeVisible();
+  await expect(page.getByRole("dialog").filter({ hasText: "GMAIL · CHOOSE SENDER" })).toBeVisible();
   await expect(page.locator("#email-to")).toHaveValue("jules@oysterhr.com");
-  await page.locator("#email-subject").fill("Following up");
+  await expect(page.locator("#email-sender-options .sender-option")).toHaveCount(3);
+  await expect(page.locator("#send-email")).toBeDisabled();
   await page.locator("#email-templates").click();
   await page.getByRole("button", { name: "Use" }).click();
   await expect(page.locator("#email-message")).toHaveValue("Happy to send the short version.");
-
-  const popupPromise = page.waitForEvent("popup");
-  await page.getByRole("button", { name: "Open in Gmail" }).click();
-  const popup = await popupPromise;
-  await popup.waitForLoadState();
-  const draftUrl = new URL(popup.url());
-  expect(draftUrl.hostname).toBe("mail.google.com");
-  expect(draftUrl.searchParams.get("to")).toBe("jules@oysterhr.com");
-  expect(draftUrl.searchParams.get("su")).toBe("Following up");
-  expect(draftUrl.searchParams.get("body")).toBe("Happy to send the short version.");
-  await expect(page.getByRole("heading", { name: "Oyster" })).toBeVisible();
+  await page.getByRole("button", { name: /Sergi Cheishvili.*sergi@stimuli.digital/ }).click();
+  await expect(page.locator("#email-composer-source")).toHaveText("GMAIL · NEW EMAIL");
+  await expect(page.locator("#send-email")).toBeDisabled();
+  await page.locator("#email-subject").fill("Following up");
+  await expect(page.locator("#send-email")).toBeEnabled();
+  await page.locator("#send-email").click();
+  await expect(page.getByRole("heading", { name: "Vanta" })).toBeVisible();
+  await expect(page.locator("#email-dialog")).not.toBeVisible();
 });
 
-test("email opens the existing Gmail thread instead of a new draft", async ({ page, context }) => {
-  await context.route("https://mail.google.com/**", async (route) => {
-    await route.fulfill({ contentType: "text/html", body: "<title>Existing Gmail thread</title>" });
+test("switching Gmail senders preserves the recipient and message and shows thread context", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: /Compose email/ }).click();
+  await page.locator("#email-message").fill("Keeping this message while I compare mailboxes.");
+  await page.getByRole("button", { name: /Sandro Truman/ }).click();
+  await expect(page.locator("#email-composer-source")).toHaveText("GMAIL · REPLY");
+  await expect(page.getByText("Yes, please send it over.")).toBeVisible();
+  await expect(page.locator("#email-subject")).toHaveValue("Oyster follow-up");
+  await expect(page.locator("#email-subject")).toHaveAttribute("readonly", "");
+
+  await page.getByRole("button", { name: /Sergi Cheishvili.*sergi@stimuli.digital/ }).click();
+  await expect(page.locator("#email-composer-source")).toHaveText("GMAIL · NEW EMAIL");
+  await expect(page.locator("#email-to")).toHaveValue("maya@oysterhr.com");
+  await expect(page.locator("#email-message")).toHaveValue("Keeping this message while I compare mailboxes.");
+  await expect(page.locator("#email-subject")).toBeEditable();
+});
+
+test("failed Gmail delivery keeps the composer and card open without retrying", async ({ page }) => {
+  let sendRequests = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/api/email/send")) sendRequests += 1;
   });
   await page.goto("/");
-
-  const popupPromise = page.waitForEvent("popup");
+  await page.locator("#contact-select").selectOption("person-jules");
   await page.getByRole("button", { name: /Compose email/ }).click();
-  const popup = await popupPromise;
-  await popup.waitForURL("https://mail.google.com/**");
-  expect(popup.url()).toBe("https://mail.google.com/mail/u/sandro@stimuli.digital/#all/mock-gmail-thread-maya");
-  await expect(page.locator("#email-dialog")).not.toBeVisible();
+  await page.getByRole("button", { name: /Sergi Cheishvili.*sergi@stimuli.digital/ }).click();
+  await page.locator("#email-subject").fill("Failure test");
+  await page.locator("#email-message").fill("MOCK_GMAIL_FAILURE");
+  await page.locator("#send-email").click();
+  await expect(page.locator("#email-dialog")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Oyster" })).toBeVisible();
+  await expect(page.locator("#email-message")).toHaveValue("MOCK_GMAIL_FAILURE");
+  await expect(page.locator("#email-mode-note")).toContainText("Delivery failed");
+  expect(sendRequests).toBe(1);
 });
 
 test("the focused card remains usable on a phone-sized viewport", async ({ page }) => {
@@ -175,6 +193,11 @@ test("the focused card remains usable on a phone-sized viewport", async ({ page 
   await expect(page.getByRole("button", { name: /Compose email/ })).toBeVisible();
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
+  await page.getByRole("button", { name: /Compose email/ }).click();
+  await expect(page.locator("#email-sender-options .sender-option")).toHaveCount(3);
+  const dialogOverflow = await page.locator("#email-dialog").evaluate((dialog) => dialog.scrollWidth - dialog.clientWidth);
+  expect(dialogOverflow).toBeLessThanOrEqual(1);
+  await page.locator('[data-close="email-dialog"]').click();
   await page.getByRole("button", { name: "Rules" }).click();
   await expect(page.getByRole("heading", { name: "Who appears here?" })).toBeVisible();
 });

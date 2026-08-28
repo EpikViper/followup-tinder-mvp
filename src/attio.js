@@ -169,6 +169,7 @@ export class AttioClient {
             .filter(Boolean),
           linkedinUrl: first(personValues.linkedin)?.value || null,
           linkedinUrn: first(personValues.linkedin_urn)?.value || null,
+          phones: (personValues.phone_numbers ?? []).map((phone) => phone.phone_number || phone.original_phone_number).filter(Boolean),
           source: readSource(personValues, companyValues, values),
         };
       });
@@ -250,6 +251,40 @@ export class AttioClient {
       method: "PATCH",
       body: JSON.stringify({ data: { values: { linkedin: url } } }),
     });
+  }
+
+  async updatePersonPhones(personId, phones) {
+    return this.request(`/objects/people/records/${encodeURIComponent(personId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ data: { values: { phone_numbers: phones.map((original_phone_number) => ({ original_phone_number })) } } }),
+    });
+  }
+
+  async updatePersonEmails(personId, emails) {
+    return this.request(`/objects/people/records/${encodeURIComponent(personId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ data: { values: { email_addresses: emails } } }),
+    });
+  }
+
+  async updateCompanyDomains(companyId, domains) {
+    return this.patchCompany(companyId, { domains: domains.map((domain) => ({ domain })) });
+  }
+
+  async createPerson({ companyId, name, linkedinUrl, email = null, phone = null }) {
+    const names = String(name).trim().split(/\s+/);
+    const values = {
+      name: [{ first_name: names[0], last_name: names.slice(1).join(" ") || null, full_name: String(name).trim() }],
+      linkedin: linkedinUrl,
+      company: [{ target_object: "companies", target_record_id: companyId }],
+    };
+    if (email) values.email_addresses = [email];
+    if (phone) values.phone_numbers = [{ original_phone_number: phone }];
+    return this.request("/objects/people/records", { method: "POST", body: JSON.stringify({ data: { values } }) });
+  }
+
+  async deleteNote(noteId) {
+    return this.request(`/notes/${encodeURIComponent(noteId)}`, { method: "DELETE" });
   }
 
   async repairInteraction({ entryId: entryIdValue, companyId, direction, date }) {

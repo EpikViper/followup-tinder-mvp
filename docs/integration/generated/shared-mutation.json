@@ -1,0 +1,2790 @@
+{
+  "name": "LinkedIn → Attio shared — mutation saga",
+  "nodes": [
+    {
+      "id": "mutation-when-called",
+      "name": "When called",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "mutation-plan-mutation",
+      "name": "Plan mutation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst input = $input.first().json;\nconst event = input.event;\nconst resolution = input.resolution || {};\nconst identityPatch = resolution.identityPatch || {};\nreturn [{ json: { ...input, event, resolution, dryRun: Boolean(input.dryRun),\n  hasIdentityPatch: Boolean(resolution.candidate?.id && Object.keys(identityPatch).length),\n  cleanupNoteId: input.cleanupNoteId || '',\n  personId: resolution.candidate?.id || input.personId || '', companyId: resolution.companyId || input.companyId || '', entryId: resolution.entryId || input.entryId || '',\n} }];\n"
+      }
+    },
+    {
+      "id": "mutation-dry-run",
+      "name": "Dry run?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-dry-run-plan",
+      "name": "Dry-run plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:true,dryRun:true,plannedMode:$json.mode,eventKey:$json.event?.eventKey||''}}];"
+      }
+    },
+    {
+      "id": "mutation-ledger-cleanup-pending",
+      "name": "Ledger cleanup pending?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ Boolean($json.cleanupNoteId) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-retry-pending-note-cleanup",
+      "name": "Attio: Retry pending note cleanup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        0
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "DELETE",
+        "url": "=https://api.attio.com/v2/notes/{{ $json.cleanupNoteId }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-pending-cleanup-result",
+      "name": "Pending cleanup result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b=$('Plan mutation').first().json;const r=$input.first().json||{};const ok=!r.error&&!(r.statusCode>=400);return [{json:{...b,cleanupOk:ok,error:ok?'':'pending note cleanup failed'}}];"
+      }
+    },
+    {
+      "id": "mutation-pending-cleanup-ok",
+      "name": "Pending cleanup OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.cleanupOk }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-pending-cleanup-failure",
+      "name": "Pending cleanup failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:false,status:'failed',error:$json.error,cleanupNoteId:$json.cleanupNoteId,completedSteps:[]}}];"
+      }
+    },
+    {
+      "id": "mutation-identity-patch-needed",
+      "name": "Identity patch needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        780,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.hasIdentityPatch }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-write-missing-identity",
+      "name": "Attio: Write missing identity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        220
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/objects/people/records/{{ $('Plan mutation').first().json.personId }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { values: $('Plan mutation').first().json.resolution.identityPatch } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-identity-already-complete",
+      "name": "Identity already complete",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        220
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mutation-identity-checkpoint",
+      "name": "Identity checkpoint",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        440
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst plan=$('Plan mutation').first().json; const response=$input.first().json||{};\nconst failed=plan.hasIdentityPatch && Boolean(response.error || response.statusCode >= 400);\nreturn [{json:{...plan,ok:!failed,error:failed?'identity patch failed':'',completedSteps:failed?[]:['identity']}}];\n"
+      }
+    },
+    {
+      "id": "mutation-identity-checkpoint-ok",
+      "name": "Identity checkpoint OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-identity-failure",
+      "name": "Identity failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        440
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:false,status:'failed',error:$json.error,eventKey:$json.event.eventKey}}];"
+      }
+    },
+    {
+      "id": "mutation-qualification-mutation",
+      "name": "Qualification mutation?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        780,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.mode === 'qualification' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-identity-only",
+      "name": "Identity only?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.mode === 'identity_only' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-identity-only-result",
+      "name": "Identity-only result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        440
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:true,status:'completed',personId:$json.personId,companyId:$json.companyId,entryId:$json.entryId,completedSteps:$json.completedSteps}}];"
+      }
+    },
+    {
+      "id": "mutation-prepare-approved-company",
+      "name": "Prepare approved company",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst input=$input.first().json; const evidence=input.companyEvidence||{};\nlet companyName=safeString(evidence.name);\nif(!companyName){ const occupation=safeString(input.event.counterpart?.occupation); const match=occupation.match(/(?:\\bat\\b|@)\\s+([^|,;]+)$/i); companyName=safeString(match?.[1]); }\nif(!companyName) return [{json:{...input,ok:false,error:'Company name could not be verified from the reviewed evidence'}}];\nconst domain=safeString(evidence.domain).toLowerCase().replace(/^https?:\\/\\//,'').replace(/^www\\./,'').split('/')[0];\nconst filters=[]; if(input.preferredCompanyId) filters.push({record_id:{$in:[input.preferredCompanyId]}}); if(domain) filters.push({domains:{domain:{$eq:domain}}}); filters.push({name:{$eq:companyName}});\nreturn [{json:{...input,ok:true,approvedCompany:{name:companyName,domain},companyQuery:{filter:{$or:filters},limit:25}}}];\n"
+      }
+    },
+    {
+      "id": "mutation-company-evidence-usable",
+      "name": "Company evidence usable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        660
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-company-evidence-failure",
+      "name": "Company evidence failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:false,status:'waiting_review',error:$json.error}}];"
+      }
+    },
+    {
+      "id": "mutation-attio-find-reusable-company",
+      "name": "Attio: Find reusable company",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        660
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://api.attio.com/v2/objects/companies/records/query",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.companyQuery) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-choose-reusable-company",
+      "name": "Choose reusable company",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst base=$('Prepare approved company').first().json; const rows=$input.first().json.data||[]; const preferred=base.preferredCompanyId?rows.find(row=>(row.id?.record_id||row.id)===base.preferredCompanyId):null;\nconst result=preferred?{status:'matched',matchBy:'reviewed_link',company:{id:preferred.id?.record_id||preferred.id,name:(((preferred.values?.name||[])[0]||{}).value||''),domains:(preferred.values?.domains||[]).map(v=>v.domain||v.value).filter(Boolean)}}:resolveCompany(base.approvedCompany,rows);\nconst original=rows.find(row=>(row.id?.record_id||row.id)===result.company?.id); const existingSource=(((original?.values?.source||[])[0]||{}).option||{}).title||'';\nreturn [{json:{...base,companyResolution:result,companyAmbiguous:result.status==='ambiguous',companyExists:result.status==='matched',companyId:result.company?.id||'',existingSource,companyNeedsSource:result.status==='matched'&&!existingSource}}];\n"
+      }
+    },
+    {
+      "id": "mutation-company-ambiguous",
+      "name": "Company ambiguous?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        660
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.companyAmbiguous }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-ambiguous-company-result",
+      "name": "Ambiguous company result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        880
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:false,status:'waiting_review',error:'Ambiguous Attio companies require review',companyCandidates:$json.companyResolution.candidates}}];"
+      }
+    },
+    {
+      "id": "mutation-reuse-company",
+      "name": "Reuse company?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        880
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.companyExists }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-campaign-source-missing",
+      "name": "Campaign source missing?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        880
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.companyNeedsSource }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-set-missing-campaign-source",
+      "name": "Attio: Set missing campaign source",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        880
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/objects/companies/records/{{ $json.companyId }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { values: { source: 'Linkedin Campaign' } } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-existing-company-source-retained",
+      "name": "Existing company source retained",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        880
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mutation-attio-create-approved-company",
+      "name": "Attio: Create approved company",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        880
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://api.attio.com/v2/objects/companies/records",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { values: Object.assign({ name: $json.approvedCompany.name, source: 'Linkedin Campaign' }, $json.approvedCompany.domain ? { domains: [$json.approvedCompany.domain] } : {}) } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-approved-company-ready",
+      "name": "Approved company ready",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        1100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst base=$('Choose reusable company').first().json; const response=$input.first().json||{};\nconst companyId=base.companyId||response.data?.id?.record_id||'';\nconst sourceWriteFailed=base.companyNeedsSource&&Boolean(response.error||response.statusCode>=400);\nreturn [{json:{...base,ok:Boolean(companyId)&&!sourceWriteFailed,companyId,error:sourceWriteFailed?'company source update failed':(companyId?'':'company create failed')}}];\n"
+      }
+    },
+    {
+      "id": "mutation-company-ready",
+      "name": "Company ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        1100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-qualification-failure",
+      "name": "Qualification failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        1100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:false,status:'failed',error:$json.error||'qualification failed'}}];"
+      }
+    },
+    {
+      "id": "mutation-attio-revalidate-person-for-qualification",
+      "name": "Attio: Revalidate person for qualification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        1100
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://api.attio.com/v2/objects/people/records/query",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ filter: { $or: [ $json.event.counterpart.urn ? { linkedin_urn: $json.event.counterpart.urn } : null, $json.event.counterpart.profileUrl ? { linkedin: $json.event.counterpart.profileUrl } : null, { name: { full_name: { $eq: $json.event.counterpart.name } } } ].filter(Boolean) }, limit: 25 }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-prepare-person-upsert",
+      "name": "Prepare person upsert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        1100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst base=$('Approved company ready').first().json; const r=resolveIdentity(base.event.counterpart,$input.first().json.data||[]);\nif(r.status==='needs_review') return [{json:{...base,ok:false,error:'Person became ambiguous during qualification'}}];\nconst existing=r.status==='matched'; const candidate=r.candidate||{}; const parts=safeString(base.event.counterpart.name).split(/\\s+/);\nconst values={ company:[{target_object:'companies',target_record_id:base.companyId}] };\nif(base.event.counterpart.urn && !candidate.urn) values.linkedin_urn=base.event.counterpart.urn;\nif(base.event.counterpart.profileUrl && !candidate.profileUrl) values.linkedin=base.event.counterpart.profileUrl;\nif(!existing) values.name={first_name:parts[0]||'',last_name:parts.slice(1).join(' '),full_name:base.event.counterpart.name};\nreturn [{json:{...base,ok:true,personExists:existing,personId:candidate.id||'',personValues:values}}];\n"
+      }
+    },
+    {
+      "id": "mutation-person-unambiguous",
+      "name": "Person unambiguous?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        1100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-reuse-person",
+      "name": "Reuse person?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        1320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.personExists }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-link-reusable-person",
+      "name": "Attio: Link reusable person",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        1320
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/objects/people/records/{{ $json.personId }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { values: $json.personValues } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-attio-create-approved-person",
+      "name": "Attio: Create approved person",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        1320
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://api.attio.com/v2/objects/people/records",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { values: $json.personValues } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-approved-person-ready",
+      "name": "Approved person ready",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        1320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst base=$('Prepare person upsert').first().json; const response=$input.first().json||{};\nconst personId=base.personId||response.data?.id?.record_id||'';\nreturn [{json:{...base,ok:Boolean(personId),personId,error:personId?'':'person write failed'}}];\n"
+      }
+    },
+    {
+      "id": "mutation-person-ready",
+      "name": "Person ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        1320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-revalidate-cold-calling-entry",
+      "name": "Attio: Revalidate Cold Calling entry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        1320
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://api.attio.com/v2/lists/7ac0b11c-204e-4c25-a744-e306606f6aa4/entries/query",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ filter: { parent_record_id: $json.companyId }, limit: 25 }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-prepare-pipeline-upsert",
+      "name": "Prepare pipeline upsert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        1540
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst base=$('Approved person ready').first().json; const entry=($input.first().json.data||[])[0]||null;\nconst stageId=base.action?.type==='qualified'?COLD_CALLING.qualifiedStageId:COLD_CALLING.notQualifiedStageId;\nreturn [{json:{...base,entryId:entry?.id?.entry_id||entry?.entry_id||'',stageId,entryExists:Boolean(entry)}}];\n"
+      }
+    },
+    {
+      "id": "mutation-pipeline-entry-exists",
+      "name": "Pipeline entry exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        1540
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.entryExists }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-apply-reviewed-stage",
+      "name": "Attio: Apply reviewed stage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        1540
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/lists/7ac0b11c-204e-4c25-a744-e306606f6aa4/entries/{{ $json.entryId }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { entry_values: { stage: $json.stageId, owner: [{ referenced_actor_type: 'workspace-member', referenced_actor_id: 'd9d9526a-9718-4861-a3b4-cc7e47f2b596' }] } } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-attio-add-reviewed-company-to-cold-calling",
+      "name": "Attio: Add reviewed company to Cold Calling",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        1540
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://api.attio.com/v2/lists/7ac0b11c-204e-4c25-a744-e306606f6aa4/entries",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { parent_object: 'companies', parent_record_id: $json.companyId, entry_values: { stage: $json.stageId, owner: [{ referenced_actor_type: 'workspace-member', referenced_actor_id: 'd9d9526a-9718-4861-a3b4-cc7e47f2b596' }] } } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-qualification-result",
+      "name": "Qualification result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        1540
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst base=$('Prepare pipeline upsert').first().json; const response=$input.first().json||{};\nconst entryId=base.entryId||response.data?.id?.entry_id||response.data?.entry_id||'';\nreturn [{json:{ok:Boolean(entryId),status:entryId?'qualified':'failed',personId:base.personId,companyId:base.companyId,entryId,stageId:base.stageId,error:entryId?'':'pipeline write failed'}}];\n"
+      }
+    },
+    {
+      "id": "mutation-dt-get-chat-state",
+      "name": "DT: Get chat state",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        1540
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "eizQME9YrnBD2rDB"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "sync_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.event.accountId + ':' + $json.event.chatId }}"
+            }
+          ]
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "mutation-attio-get-company-before-commit",
+      "name": "Attio: Get company before commit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        1760
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "url": "=https://api.attio.com/v2/objects/companies/records/{{ $('Identity checkpoint').first().json.companyId }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-attio-get-entry-before-commit",
+      "name": "Attio: Get entry before commit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        1760
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "url": "=https://api.attio.com/v2/lists/7ac0b11c-204e-4c25-a744-e306606f6aa4/entries/{{ $('Identity checkpoint').first().json.entryId }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-unipile-paginate-complete-history",
+      "name": "Unipile: Paginate complete history",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        1760
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "cursor",
+                    "value": "={{ $response.body.cursor }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.cursor }}",
+              "limitPagesFetched": true,
+              "maxRequests": 100,
+              "requestInterval": 100
+            }
+          }
+        },
+        "url": "=https://api8.unipile.com:13818/api/v1/chats/{{ $('Identity checkpoint').first().json.event.chatId }}/messages?limit=100"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "XgIwy3Ic6GILqQWf",
+          "name": "Unipile API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-build-guarded-commit",
+      "name": "Build guarded commit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        1760
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst input=$('Identity checkpoint').first().json;\nconst stateRows=$('DT: Get chat state').all().map(i=>i.json).filter(r=>r.sync_key);\nconst state=stateRows.sort((a,b)=>new Date(b.updated_at||0)-new Date(a.updated_at||0))[0]||{};\nconst guard=applyEventTimeGuard(state,input.event);\nconst pages=$input.all().map(i=>i.json); const raw=pages.flatMap(p=>Array.isArray(p.items)?p.items:[]);\nif(!raw.some(m=>(m.id||m.message_id)===input.event.messageId)) raw.push({id:input.event.messageId,timestamp:input.event.timestamp,text:input.event.text,is_sender:input.event.direction==='outbound'?1:0});\nconst history=dedupeAndSortMessages(raw,{cap:10000});\nconst lastPage=pages[pages.length-1]||{}; const truncated=history.truncated||Boolean(lastPage.cursor);\nconst transcript=buildTranscript(history.messages,{repName:input.event.repName,counterpartName:input.event.counterpart.name});\nconst companyResponse=$('Attio: Get company before commit').first().json; const company=companyResponse.data||companyResponse;\nconst noteRaw=((company.values?.linkedin_note_id||[])[0]||{}).value||'{}'; let noteMap={}; try{noteMap=JSON.parse(noteRaw)||{};}catch{}\nconst entryResponse=$('Attio: Get entry before commit').first().json; const entry=entryResponse.data||entryResponse; const values=entry.entry_values||{};\nconst currentDate=((values.last_follow_up||[])[0]||{}).value||null; const currentCount=Number(((values.number_of_follow_ups||[])[0]||{}).value||0);\nconst day=t=>new Date(t).toLocaleDateString('en-CA',{timeZone:'Asia/Tbilisi'}); let prev=null,derivedCount=0;\nfor(const m of history.messages){const ours=m.is_sender===1||m.isSender===true;const d=day(m.timestamp);if(ours&&prev?.ours&&d>prev.day)derivedCount++;prev={ours,day:d};}\nconst latest=history.messages.at(-1)||{}; const latestDay=latest.timestamp?day(latest.timestamp):null;\nconst entryValues={}; if(guard.shouldAdvance&&latestDay) entryValues.last_follow_up=latestDay; if(!currentCount&&derivedCount) entryValues.number_of_follow_ups=derivedCount;\nreturn [{json:{...input,state,guard,historyTruncated:truncated,historyCount:history.totalUnique,noteMap,oldNoteId:state.note_id||noteMap[input.event.chatId]||'',\n  noteTitle:'LinkedIn thread — '+input.event.repName+' ↔ '+(input.event.counterpart.name||'Unknown'),\n  noteBody:'Rebuilt automatically from LinkedIn via Unipile - do not edit by hand.'+(truncated?'\\n(History exceeded 10,000 messages; transcript is explicitly truncated.)':'')+'\\n\\n'+transcript,\n  companyPatch:guard.shouldAdvance?{data:{values:{last_interaction_by:input.event.direction==='outbound'?'e49570ae-01ef-4cf5-8f26-9bc3c18ce9d5':'4d8ba426-f284-469a-a53e-ed98ad6cf516'}}}:null,\n  entryPatch:Object.keys(entryValues).length?{data:{entry_values:entryValues}}:null,\n}}];\n"
+      }
+    },
+    {
+      "id": "mutation-advance-interaction-state",
+      "name": "Advance interaction state?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        1760
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ Boolean($json.companyPatch) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-advance-interaction-direction",
+      "name": "Attio: Advance interaction direction",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        1760
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/objects/companies/records/{{ $json.companyId }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.companyPatch) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-interaction-already-newer",
+      "name": "Interaction already newer",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1980
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mutation-pipeline-patch-needed",
+      "name": "Pipeline patch needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        1980
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ Boolean($('Build guarded commit').first().json.entryPatch) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-advance-guarded-pipeline-state",
+      "name": "Attio: Advance guarded pipeline state",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        1980
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/lists/7ac0b11c-204e-4c25-a744-e306606f6aa4/entries/{{ $('Build guarded commit').first().json.entryId }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build guarded commit').first().json.entryPatch) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-pipeline-state-already-current",
+      "name": "Pipeline state already current",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        780,
+        1980
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mutation-attio-create-replacement-transcript",
+      "name": "Attio: Create replacement transcript",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        1980
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://api.attio.com/v2/notes",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { parent_object: 'companies', parent_record_id: $('Build guarded commit').first().json.companyId, title: $('Build guarded commit').first().json.noteTitle, format: 'plaintext', content: $('Build guarded commit').first().json.noteBody } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-replacement-created",
+      "name": "Replacement created?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        1980
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst base=$('Build guarded commit').first().json; const response=$input.first().json||{}; const newNoteId=response.data?.id?.note_id||'';\nreturn [{json:{...base,newNoteId,noteCreated:Boolean(newNoteId),error:newNoteId?'':'replacement note creation failed'}}];\n"
+      }
+    },
+    {
+      "id": "mutation-replacement-note-exists",
+      "name": "Replacement note exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        2200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.noteCreated }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-transcript-create-failure",
+      "name": "Transcript create failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        2200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:false,status:'failed',error:$json.error,completedSteps:['identity','interaction'],personId:$json.personId,companyId:$json.companyId,entryId:$json.entryId}}];"
+      }
+    },
+    {
+      "id": "mutation-attio-commit-transcript-pointer",
+      "name": "Attio: Commit transcript pointer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        2200
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "PATCH",
+        "url": "=https://api.attio.com/v2/objects/companies/records/{{ $json.companyId }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ data: { values: { linkedin_note_id: JSON.stringify(Object.assign({}, $json.noteMap, { [$json.event.chatId]: $json.newNoteId })) } } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-pointer-committed",
+      "name": "Pointer committed?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        2200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst base=$('Replacement created?').first().json; const response=$input.first().json||{}; const ok=Boolean(response.data)&&!response.error;\nreturn [{json:{...base,pointerCommitted:ok,error:ok?'':'transcript pointer commit failed'}}];\n"
+      }
+    },
+    {
+      "id": "mutation-pointer-commit-ok",
+      "name": "Pointer commit OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        2200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.pointerCommitted }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-delete-uncommitted-replacement",
+      "name": "Attio: Delete uncommitted replacement",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        2200
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "DELETE",
+        "url": "=https://api.attio.com/v2/notes/{{ $json.newNoteId }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-pointer-failure-result",
+      "name": "Pointer failure result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        2420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b=$('Pointer committed?').first().json;const r=$input.first().json||{};const cleanupFailed=Boolean(r.error||r.statusCode>=400);return [{json:{ok:false,status:'failed',error:b.error,cleanupNoteId:cleanupFailed?b.newNoteId:'',completedSteps:['identity','interaction'],personId:b.personId,companyId:b.companyId,entryId:b.entryId}}];"
+      }
+    },
+    {
+      "id": "mutation-old-transcript-exists",
+      "name": "Old transcript exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        2420
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ Boolean($json.oldNoteId && $json.oldNoteId !== $json.newNoteId) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-attio-cleanup-old-transcript",
+      "name": "Attio: Cleanup old transcript",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        2420
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "DELETE",
+        "url": "=https://api.attio.com/v2/notes/{{ $json.oldNoteId }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "oO2dlTi8cx1EPM4j",
+          "name": "Attio API (download leads)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "mutation-no-old-transcript",
+      "name": "No old transcript",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        780,
+        2420
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mutation-finalize-transcript-saga",
+      "name": "Finalize transcript saga",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        2420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst b=$('Pointer committed?').first().json; const response=$input.first().json||{};\nconst cleanupFailed=Boolean(b.oldNoteId)&&Boolean(response.error||response.statusCode>=400);\nreturn [{json:{sync_key:b.event.accountId+':'+b.event.chatId,account_id:b.event.accountId,chat_id:b.event.chatId,company_id:b.companyId,person_id:b.personId,\n newest_committed_at:b.guard.newestCommittedAt||b.state.newest_committed_at,newest_message_id:b.guard.shouldAdvance?b.event.messageId:(b.state.newest_message_id||''),last_direction:b.guard.direction,\n note_id:b.newNoteId,cleanup_note_id:cleanupFailed?b.oldNoteId:'',history_cursor:'',history_truncated:b.historyTruncated,lock_until:new Date(0).toISOString(),lock_owner:'',updated_at:new Date().toISOString(),\n ok:!cleanupFailed,status:cleanupFailed?'failed':'completed',error:cleanupFailed?'old transcript cleanup failed':'',entryId:b.entryId,completedSteps:['identity','interaction','note_created','pointer_committed'].concat(cleanupFailed?[]:['old_note_cleaned'])}}];\n"
+      }
+    },
+    {
+      "id": "mutation-dt-commit-chat-state",
+      "name": "DT: Commit chat state",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        2420
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "eizQME9YrnBD2rDB"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "sync_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.sync_key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "sync_key": "={{ $json.sync_key }}",
+            "account_id": "={{ $json.account_id }}",
+            "chat_id": "={{ $json.chat_id }}",
+            "company_id": "={{ $json.company_id }}",
+            "person_id": "={{ $json.person_id }}",
+            "newest_committed_at": "={{ $json.newest_committed_at }}",
+            "newest_message_id": "={{ $json.newest_message_id }}",
+            "last_direction": "={{ $json.last_direction }}",
+            "note_id": "={{ $json.note_id }}",
+            "cleanup_note_id": "={{ $json.cleanup_note_id }}",
+            "history_cursor": "",
+            "history_truncated": "={{ $json.history_truncated }}",
+            "lock_until": "={{ $json.lock_until }}",
+            "lock_owner": "",
+            "updated_at": "={{ $json.updated_at }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mutation-sync-mutation-result",
+      "name": "Sync mutation result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        2640
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b=$('Finalize transcript saga').first().json;return [{json:{ok:b.ok,status:b.status,error:b.error,personId:b.person_id,companyId:b.company_id,entryId:b.entryId,noteId:b.note_id,cleanupNoteId:b.cleanup_note_id,historyTruncated:b.history_truncated,completedSteps:b.completedSteps}}];"
+      }
+    }
+  ],
+  "connections": {
+    "When called": {
+      "main": [
+        [
+          {
+            "node": "Plan mutation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan mutation": {
+      "main": [
+        [
+          {
+            "node": "Dry run?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry run?": {
+      "main": [
+        [
+          {
+            "node": "Dry-run plan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ledger cleanup pending?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ledger cleanup pending?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Retry pending note cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Identity patch needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Retry pending note cleanup": {
+      "main": [
+        [
+          {
+            "node": "Pending cleanup result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pending cleanup result": {
+      "main": [
+        [
+          {
+            "node": "Pending cleanup OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pending cleanup OK?": {
+      "main": [
+        [
+          {
+            "node": "Identity patch needed?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Pending cleanup failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Identity patch needed?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Write missing identity",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Identity already complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Write missing identity": {
+      "main": [
+        [
+          {
+            "node": "Identity checkpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Identity already complete": {
+      "main": [
+        [
+          {
+            "node": "Identity checkpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Identity checkpoint": {
+      "main": [
+        [
+          {
+            "node": "Identity checkpoint OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Identity checkpoint OK?": {
+      "main": [
+        [
+          {
+            "node": "Qualification mutation?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Identity failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qualification mutation?": {
+      "main": [
+        [
+          {
+            "node": "Prepare approved company",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Identity only?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Identity only?": {
+      "main": [
+        [
+          {
+            "node": "Identity-only result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DT: Get chat state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare approved company": {
+      "main": [
+        [
+          {
+            "node": "Company evidence usable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Company evidence usable?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Find reusable company",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Company evidence failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Find reusable company": {
+      "main": [
+        [
+          {
+            "node": "Choose reusable company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Choose reusable company": {
+      "main": [
+        [
+          {
+            "node": "Company ambiguous?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Company ambiguous?": {
+      "main": [
+        [
+          {
+            "node": "Ambiguous company result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reuse company?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reuse company?": {
+      "main": [
+        [
+          {
+            "node": "Campaign source missing?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Attio: Create approved company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Campaign source missing?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Set missing campaign source",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Existing company source retained",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Set missing campaign source": {
+      "main": [
+        [
+          {
+            "node": "Approved company ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Existing company source retained": {
+      "main": [
+        [
+          {
+            "node": "Approved company ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Create approved company": {
+      "main": [
+        [
+          {
+            "node": "Approved company ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved company ready": {
+      "main": [
+        [
+          {
+            "node": "Company ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Company ready?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Revalidate person for qualification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Qualification failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Revalidate person for qualification": {
+      "main": [
+        [
+          {
+            "node": "Prepare person upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare person upsert": {
+      "main": [
+        [
+          {
+            "node": "Person unambiguous?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Person unambiguous?": {
+      "main": [
+        [
+          {
+            "node": "Reuse person?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Qualification failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reuse person?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Link reusable person",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Attio: Create approved person",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Link reusable person": {
+      "main": [
+        [
+          {
+            "node": "Approved person ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Create approved person": {
+      "main": [
+        [
+          {
+            "node": "Approved person ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved person ready": {
+      "main": [
+        [
+          {
+            "node": "Person ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Person ready?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Revalidate Cold Calling entry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Qualification failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Revalidate Cold Calling entry": {
+      "main": [
+        [
+          {
+            "node": "Prepare pipeline upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare pipeline upsert": {
+      "main": [
+        [
+          {
+            "node": "Pipeline entry exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipeline entry exists?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Apply reviewed stage",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Attio: Add reviewed company to Cold Calling",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Apply reviewed stage": {
+      "main": [
+        [
+          {
+            "node": "Qualification result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Add reviewed company to Cold Calling": {
+      "main": [
+        [
+          {
+            "node": "Qualification result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Get chat state": {
+      "main": [
+        [
+          {
+            "node": "Attio: Get company before commit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Get company before commit": {
+      "main": [
+        [
+          {
+            "node": "Attio: Get entry before commit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Get entry before commit": {
+      "main": [
+        [
+          {
+            "node": "Unipile: Paginate complete history",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unipile: Paginate complete history": {
+      "main": [
+        [
+          {
+            "node": "Build guarded commit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build guarded commit": {
+      "main": [
+        [
+          {
+            "node": "Advance interaction state?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Advance interaction state?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Advance interaction direction",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Interaction already newer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Advance interaction direction": {
+      "main": [
+        [
+          {
+            "node": "Pipeline patch needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interaction already newer": {
+      "main": [
+        [
+          {
+            "node": "Pipeline patch needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipeline patch needed?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Advance guarded pipeline state",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Pipeline state already current",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Advance guarded pipeline state": {
+      "main": [
+        [
+          {
+            "node": "Attio: Create replacement transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipeline state already current": {
+      "main": [
+        [
+          {
+            "node": "Attio: Create replacement transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Create replacement transcript": {
+      "main": [
+        [
+          {
+            "node": "Replacement created?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replacement created?": {
+      "main": [
+        [
+          {
+            "node": "Replacement note exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replacement note exists?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Commit transcript pointer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Transcript create failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Commit transcript pointer": {
+      "main": [
+        [
+          {
+            "node": "Pointer committed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pointer committed?": {
+      "main": [
+        [
+          {
+            "node": "Pointer commit OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pointer commit OK?": {
+      "main": [
+        [
+          {
+            "node": "Old transcript exists?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Attio: Delete uncommitted replacement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Delete uncommitted replacement": {
+      "main": [
+        [
+          {
+            "node": "Pointer failure result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Old transcript exists?": {
+      "main": [
+        [
+          {
+            "node": "Attio: Cleanup old transcript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No old transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attio: Cleanup old transcript": {
+      "main": [
+        [
+          {
+            "node": "Finalize transcript saga",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No old transcript": {
+      "main": [
+        [
+          {
+            "node": "Finalize transcript saga",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize transcript saga": {
+      "main": [
+        [
+          {
+            "node": "DT: Commit chat state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Commit chat state": {
+      "main": [
+        [
+          {
+            "node": "Sync mutation result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "k33dMa0HRqqRzbK1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  }
+}

@@ -1,0 +1,1932 @@
+{
+  "name": "LinkedIn → Attio shared — durable event processor",
+  "nodes": [
+    {
+      "id": "processor-when-called",
+      "name": "When called",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "processor-normalize-envelope",
+      "name": "Normalize envelope",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst input=$input.first().json; const event=input.event?.eventKey?input.event:(input.eventKey?input:normalizeUnipileEvent(input));\nreturn [{json:{...input,event,proceed:Boolean(event?.proceed!==false&&event?.eventKey),skipReason:event?.skipReason||''}}];\n"
+      }
+    },
+    {
+      "id": "processor-processable-event",
+      "name": "Processable event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.proceed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-ignored-event",
+      "name": "Ignored event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:true,status:'ignored',reason:$json.skipReason}}];"
+      }
+    },
+    {
+      "id": "processor-dt-get-event-ledger",
+      "name": "DT: Get event ledger",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        0
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "y3BvGIGRQqVrpGM7"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "event_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.event.eventKey }}"
+            }
+          ]
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "processor-coalesce-and-gate-event",
+      "name": "Coalesce and gate event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst input=$('Normalize envelope').first().json; const rows=$input.all().map(i=>i.json).filter(r=>r.event_key);\nconst decision=input.action?{process:true,reason:'human_action',attempts:Number(rows[0]?.attempts||0)+1,completedSteps:[]} : eventLedgerDecision(rows);\nreturn [{json:{...input,decision,attempts:decision.attempts||Number(rows[0]?.attempts||1),completedSteps:decision.completedSteps||[]}}];\n"
+      }
+    },
+    {
+      "id": "processor-should-run",
+      "name": "Should run?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.decision.process }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-completed-or-busy",
+      "name": "Completed or busy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{ok:true,status:$json.decision.reason,eventKey:$json.event.eventKey}}];"
+      }
+    },
+    {
+      "id": "processor-dt-mark-processing",
+      "name": "DT: Mark processing",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        520,
+        220
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "y3BvGIGRQqVrpGM7"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "event_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.event.eventKey }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_key": "={{ $json.event.eventKey }}",
+            "account_id": "={{ $json.event.accountId }}",
+            "chat_id": "={{ $json.event.chatId }}",
+            "message_id": "={{ $json.event.messageId }}",
+            "event_timestamp": "={{ $json.event.timestamp }}",
+            "direction": "={{ $json.event.direction }}",
+            "status": "processing",
+            "attempts": "={{ $json.attempts }}",
+            "completed_steps": "={{ JSON.stringify($json.completedSteps || []) }}",
+            "outputs": "{}",
+            "last_error": "",
+            "normalized_event": "={{ JSON.stringify($json.event) }}",
+            "case_key": "",
+            "person_id": "",
+            "company_id": "",
+            "started_at": "={{ $now.toISO() }}",
+            "updated_at": "={{ $now.toISO() }}",
+            "next_retry_at": "={{ $now.toISO() }}",
+            "stale_after": "={{ $now.plus({ minutes: 20 }).toISO() }}",
+            "cleanup_note_id": ""
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-prepare-resolver-call",
+      "name": "Prepare resolver call",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const base=$('Coalesce and gate event').first().json;return [{json:{event:base.event,action:base.action||null}}];"
+      }
+    },
+    {
+      "id": "processor-call-shared-resolver",
+      "name": "Call shared resolver",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        220
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "nq1qLhsAF2LEvRqm"
+        },
+        "mode": "each",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "processor-route-resolution",
+      "name": "Route resolution",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst base=$('Coalesce and gate event').first().json; const resolved=$input.first().json; const r=resolved.resolution||{}; const action=base.action||{};\nlet route='complete'; let mutationMode=''; let caseReason='';\nif(action.type==='different_person') { route=base.event.direction==='inbound'?'case':'complete'; caseReason='qualification'; }\nelse if(action.type==='qualified'||action.type==='not_qualified') { route='qualification'; mutationMode='qualification'; }\nelse if(r.status==='needs_review') { route='case'; caseReason='identity_'+(r.reason||'review'); }\nelse if(r.status==='unmatched') { route='case'; caseReason='company_'+(r.reason||'unresolved'); }\nelse if(r.status==='matched'&&r.onPipeline) { route='sync'; mutationMode='sync'; }\nelse if(r.status==='matched') { route='identity_then_case'; mutationMode='identity_only'; caseReason='qualification'; }\nreturn [{json:{...base,...resolved,resolution:r,route,mutationMode,caseReason}}];\n"
+      }
+    },
+    {
+      "id": "processor-resolution-route",
+      "name": "Resolution route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        0,
+        440
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "sync",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "sync",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sync"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "identity_then_case",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "identity_then_case",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "identity_then_case"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "case",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "case",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "case"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "wait_or_case",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "wait_or_case",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "wait_or_case"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "qualification",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "qualification",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "qualification"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "processor-prepare-sync-mutation",
+      "name": "Prepare sync mutation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        440
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const $json = $input.first().json;\nreturn [{json:{mode:$json.mutationMode,event:$json.event,resolution:$json.resolution,action:$json.action||null,companyEvidence:$json.companyEvidence||null,preferredCompanyId:$json.preferredCompanyId||'',cleanupNoteId:$json.decision?.canonical?.cleanup_note_id||''}}];"
+      }
+    },
+    {
+      "id": "processor-call-shared-mutation",
+      "name": "Call shared mutation",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        440
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "jOsn22Igc1CGJr5x"
+        },
+        "mode": "each",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "processor-evaluate-mutation",
+      "name": "Evaluate mutation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        440
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const base=$('Route resolution').first().json;const result=$input.first().json||{};const routeAfterMutation=base.route==='identity_then_case'?'case':(base.route==='qualification'?'sync_after_qualification':'complete');return [{json:{...base,mutationResult:result,mutationOk:Boolean(result.ok),routeAfterMutation}}];"
+      }
+    },
+    {
+      "id": "processor-mutation-ok",
+      "name": "Mutation OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.mutationOk }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-open-case-after-identity",
+      "name": "Open case after identity?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.routeAfterMutation === 'case' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-sync-after-qualification",
+      "name": "Sync after qualification?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        660
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.routeAfterMutation === 'sync_after_qualification' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-prepare-post-qualification-sync",
+      "name": "Prepare post-qualification sync",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst b=$input.first().json;const r=b.mutationResult;return [{json:{mode:'sync',event:b.event,action:b.action,resolution:{status:'matched',matchBy:'qualification_review',candidate:{id:r.personId,name:b.event.counterpart.name,urn:b.event.counterpart.urn,profileUrl:b.event.counterpart.profileUrl,companyIds:[r.companyId]},identityPatch:{},companyId:r.companyId,entryId:r.entryId,onPipeline:true}}}];\n"
+      }
+    },
+    {
+      "id": "processor-call-sync-after-qualification",
+      "name": "Call sync after qualification",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        660
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "jOsn22Igc1CGJr5x"
+        },
+        "mode": "each",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "processor-evaluate-post-qualification-sync",
+      "name": "Evaluate post-qualification sync",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        660
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const base=$('Evaluate mutation').first().json;const result=$input.first().json||{};return [{json:{...base,mutationResult:result,mutationOk:Boolean(result.ok),routeAfterMutation:'complete'}}];"
+      }
+    },
+    {
+      "id": "processor-post-qualification-sync-ok",
+      "name": "Post-qualification sync OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        660
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.mutationOk }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-dt-mark-failed",
+      "name": "DT: Mark failed",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        660
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "y3BvGIGRQqVrpGM7"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "event_key",
+              "condition": "eq",
+              "keyValue": "={{ $('Route resolution').first().json.event.eventKey }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_key": "={{ $('Route resolution').first().json.event.eventKey }}",
+            "status": "failed",
+            "attempts": "={{ $('Route resolution').first().json.attempts }}",
+            "completed_steps": "={{ JSON.stringify($json.mutationResult?.completedSteps || []) }}",
+            "outputs": "={{ JSON.stringify($json.mutationResult || {}) }}",
+            "last_error": "={{ $json.mutationResult?.error || 'mutation failed' }}",
+            "normalized_event": "={{ JSON.stringify($('Route resolution').first().json.event) }}",
+            "person_id": "={{ $json.mutationResult?.personId || '' }}",
+            "company_id": "={{ $json.mutationResult?.companyId || '' }}",
+            "updated_at": "={{ $now.toISO() }}",
+            "next_retry_at": "={{ $now.plus({ minutes: 15 }).toISO() }}",
+            "stale_after": "={{ $now.toISO() }}",
+            "cleanup_note_id": "={{ $json.mutationResult?.cleanupNoteId || '' }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-failed-result",
+      "name": "Failed result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        880
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "let result={};try{result=$('Evaluate post-qualification sync').first().json.mutationResult||{};}catch{result=$('Evaluate mutation').first().json.mutationResult||{};}return [{json:{ok:false,status:'failed',eventKey:$('Route resolution').first().json.event.eventKey,error:result.error||'mutation failed'}}];"
+      }
+    },
+    {
+      "id": "processor-live-sendpilot-wait",
+      "name": "Live SendPilot wait?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        880
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.source !== 'nightly' && !$json.action }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-hold-15-minutes-for-sendpilot",
+      "name": "Hold 15 minutes for SendPilot",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        520,
+        880
+      ],
+      "parameters": {
+        "amount": 15,
+        "unit": "minutes"
+      }
+    },
+    {
+      "id": "processor-resume-original-event",
+      "name": "Resume original event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        880
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b=$('Route resolution').first().json;return [{json:{event:b.event,action:b.action||null}}];"
+      }
+    },
+    {
+      "id": "processor-re-run-shared-resolver",
+      "name": "Re-run shared resolver",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        880
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "nq1qLhsAF2LEvRqm"
+        },
+        "mode": "each",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "processor-route-recheck",
+      "name": "Route recheck",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        880
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst base=$('Route resolution').first().json; const resolved=$input.first().json; const r=resolved.resolution||{};\nlet route=r.status==='matched'&&r.onPipeline?'sync':(r.status==='matched'?'identity_then_case':'case');\nreturn [{json:{...base,...resolved,resolution:r,route,mutationMode:route==='sync'?'sync':'identity_only',caseReason:r.status==='needs_review'?'identity_'+(r.reason||'review'):'qualification'}}];\n"
+      }
+    },
+    {
+      "id": "processor-resolved-after-wait",
+      "name": "Resolved after wait?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        1100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.route === 'sync' || $json.route === 'identity_then_case' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-prepare-durable-case",
+      "name": "Prepare durable case",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        1100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst base=$input.first().json; const reason=base.caseReason||'qualification'; const caseKey=base.event.accountId+':'+base.event.chatId+':'+reason;\nreturn [{json:{...base,caseKey,reason}}];\n"
+      }
+    },
+    {
+      "id": "processor-dt-get-case",
+      "name": "DT: Get case",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        520,
+        1100
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "MwDh3e70jYQpCgy3"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "case_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.caseKey }}"
+            }
+          ]
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "processor-build-or-update-slack-case",
+      "name": "Build or update Slack case",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        1100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const LINKEDIN_ACCOUNTS = Object.freeze({\n  \"5Oe83EFfTgS7GDIScVXrPg\": { repName: \"Sandro\", selfId: \"ACoAAEbLafgBVt1BHLkVrKyprVfRMG6HIAScJ6k\" },\n  EmucfXukRDejlX7QvAw2GQ: { repName: \"Sergi\", selfId: \"ACoAACdLDRcBDAmGHRg86rWWc2UGvZKZB-0IicQ\" },\n  \"YcO4z477S8aHln4L-EIUGw\": { repName: \"Revaz\", selfId: \"ACoAADLD3rgByE78rqHVRjNyw9DiEm1_9v82288\" },\n});\n\nconst COLD_CALLING = Object.freeze({\n  listId: \"7ac0b11c-204e-4c25-a744-e306606f6aa4\",\n  ownerId: \"d9d9526a-9718-4861-a3b4-cc7e47f2b596\",\n  source: \"Linkedin Campaign\",\n  notQualifiedStageId: \"47a0e793-0d7d-47ae-b226-4a655fe48677\",\n  qualifiedStageId: \"40b48a97-8ab7-48a5-9560-95f56778fc31\",\n});\n\nconst safeString = (value) => String(value ?? \"\").trim();\n\nfunction normalizeName(value) {\n  return safeString(value)\n    .normalize(\"NFKC\")\n    .replace(/[\\p{Extended_Pictographic}\\p{So}\\p{Sk}\\u{FE0F}\\u{200D}]/gu, \" \")\n    .replace(/^[^\\p{L}\\p{N}]+/u, \"\")\n    .replace(/[^\\p{L}\\p{N}.]+$/u, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .toLocaleLowerCase(\"en\");\n}\n\nfunction canonicalLinkedInUrl(value) {\n  let raw = safeString(value);\n  if (!raw) return \"\";\n  if (!/^https?:\\/\\//i.test(raw)) raw = `https://${raw}`;\n  try {\n    const url = new URL(raw);\n    const host = url.hostname.toLocaleLowerCase(\"en\").replace(/^www\\./, \"\");\n    if (host !== \"linkedin.com\" && !host.endsWith(\".linkedin.com\")) return \"\";\n    const parts = url.pathname.split(\"/\").filter(Boolean);\n    const index = parts.findIndex((part) => part.toLocaleLowerCase(\"en\") === \"in\");\n    if (index < 0 || !parts[index + 1]) return \"\";\n    const slug = decodeURIComponent(parts[index + 1]).trim().toLocaleLowerCase(\"en\");\n    return slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : \"\";\n  } catch {\n    return \"\";\n  }\n}\n\nfunction attachmentLabel(message) {\n  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];\n  const attachment = attachments[0] || message?.attachment || null;\n  const type = safeString(\n    attachment?.type || attachment?.mime_type || attachment?.content_type || message?.attachment_type,\n  ).split(\"/\").pop();\n  return type ? `[Attachment: ${type}]` : \"[Attachment]\";\n}\n\nfunction attendeeOccupation(attendee) {\n  return safeString(attendee?.attendee_specifics?.occupation || attendee?.occupation || attendee?.headline);\n}\n\nfunction profileUrlOf(attendee) {\n  return canonicalLinkedInUrl(\n    attendee?.attendee_profile_url || attendee?.profile_url || attendee?.public_profile_url ||\n      attendee?.attendee_public_identifier,\n  );\n}\n\nfunction normalizeUnipileEvent(payload, { now = new Date() } = {}) {\n  const body = payload?.body || payload || {};\n  const eventName = body.event || body.event_type;\n  if (eventName && eventName !== \"message_received\") return { proceed: false, skipReason: `event: ${eventName}` };\n  if (safeString(body.account_type).toUpperCase() !== \"LINKEDIN\") return { proceed: false, skipReason: \"not linkedin\" };\n\n  const account = LINKEDIN_ACCOUNTS[body.account_id];\n  if (!account) return { proceed: false, skipReason: \"account out of scope\" };\n  const attendees = Array.isArray(body.attendees) ? body.attendees : [];\n  if (body.is_group === true || body.is_group === 1 || attendees.length > 2) {\n    return { proceed: false, skipReason: \"not a 1:1 thread\" };\n  }\n\n  const messageId = safeString(body.message_id || body.id);\n  const chatId = safeString(body.chat_id);\n  if (!messageId || !chatId) return { proceed: false, skipReason: \"missing chat or message id\" };\n\n  const selfId = safeString(body.account_info?.user_id) || account.selfId;\n  let direction;\n  if (body.is_sender === 1 || body.is_sender === true) direction = \"outbound\";\n  else if (body.is_sender === 0 || body.is_sender === false) direction = \"inbound\";\n  else direction = safeString(body.sender?.attendee_provider_id) === selfId ? \"outbound\" : \"inbound\";\n\n  const counterpart = attendees.find((attendee) =>\n    safeString(attendee?.attendee_provider_id || attendee?.provider_id) !== selfId,\n  ) || (direction === \"inbound\" ? body.sender : null) || {};\n  const originalName = safeString(counterpart.attendee_name || counterpart.name);\n  const displayName = originalName.replace(/\\s+/g, \" \").trim();\n  const urn = safeString(counterpart.attendee_provider_id || counterpart.provider_id);\n  const profileUrl = profileUrlOf(counterpart);\n  if (!urn && !profileUrl && !displayName) return { proceed: false, skipReason: \"counterpart has no usable identity\" };\n\n  const rawText = safeString(body.message || body.text);\n  const hasAttachment = Boolean(\n    body.attachment || body.attachment_type || (Array.isArray(body.attachments) && body.attachments.length),\n  );\n  if (!rawText && !hasAttachment) return { proceed: false, skipReason: \"empty event\" };\n  const timestamp = new Date(body.timestamp || now);\n  if (Number.isNaN(timestamp.valueOf())) return { proceed: false, skipReason: \"invalid timestamp\" };\n\n  const text = rawText || attachmentLabel(body);\n  return {\n    proceed: true,\n    eventKey: `${body.account_id}:${messageId}`,\n    accountId: body.account_id,\n    chatId,\n    messageId,\n    timestamp: timestamp.toISOString(),\n    direction,\n    text,\n    repName: account.repName,\n    selfId,\n    counterpart: {\n      urn,\n      profileUrl,\n      name: displayName,\n      originalName,\n      normalizedName: normalizeName(displayName),\n      occupation: attendeeOccupation(counterpart),\n    },\n    originalPayloadRef: {\n      event: eventName || \"message_received\",\n      accountId: body.account_id,\n      chatId,\n      messageId,\n    },\n  };\n}\n\nfunction firstValue(record, slug) {\n  return (record?.values?.[slug] || [])[0] || {};\n}\n\nfunction attioPersonIdentity(record) {\n  const name = safeString(firstValue(record, \"name\").full_name || firstValue(record, \"name\").value);\n  const urn = safeString(firstValue(record, \"linkedin_urn\").value);\n  const profileUrl = canonicalLinkedInUrl(firstValue(record, \"linkedin\").value || firstValue(record, \"linkedin\").url);\n  const companies = (record?.values?.company || []).map((value) => value.target_record_id).filter(Boolean);\n  return {\n    id: record?.id?.record_id || record?.id || \"\",\n    name,\n    normalizedName: normalizeName(name),\n    urn,\n    profileUrl,\n    companyIds: [...new Set(companies)],\n  };\n}\n\nfunction namesArePartial(left, right) {\n  const a = normalizeName(left).split(\" \").filter(Boolean);\n  const b = normalizeName(right).split(\" \").filter(Boolean);\n  if (a.length < 2 || b.length < 2 || a[0] !== b[0]) return false;\n  const tailA = a.slice(1).join(\" \");\n  const tailB = b.slice(1).join(\" \");\n  return tailA === tailB || tailA.startsWith(tailB) || tailB.startsWith(tailA) ||\n    (tailA.length === 1 && tailB.startsWith(tailA)) || (tailB.length === 1 && tailA.startsWith(tailB));\n}\n\nfunction identityConflicts(incoming, candidate) {\n  const conflicts = [];\n  if (incoming.urn && candidate.urn && incoming.urn !== candidate.urn) conflicts.push(\"linkedin_urn\");\n  const incomingProfileUrl = canonicalLinkedInUrl(incoming.profileUrl);\n  if (incomingProfileUrl && candidate.profileUrl && incomingProfileUrl !== candidate.profileUrl) {\n    conflicts.push(\"linkedin_profile_url\");\n  }\n  return conflicts;\n}\n\nfunction resolveIdentity(incoming, records) {\n  const candidates = records.map(attioPersonIdentity).filter((candidate) => candidate.id);\n  const urnMatches = incoming.urn ? candidates.filter((candidate) => candidate.urn === incoming.urn) : [];\n  if (urnMatches.length === 1) return acceptedIdentity(\"urn\", incoming, urnMatches[0]);\n  if (urnMatches.length > 1) return reviewIdentity(\"conflicting_urn_candidates\", incoming, urnMatches);\n\n  const urlMatches = incoming.profileUrl\n    ? candidates.filter((candidate) => candidate.profileUrl === canonicalLinkedInUrl(incoming.profileUrl))\n    : [];\n  if (urlMatches.length === 1) {\n    const conflicts = identityConflicts(incoming, urlMatches[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, urlMatches) : acceptedIdentity(\"profile_url\", incoming, urlMatches[0]);\n  }\n  if (urlMatches.length > 1) return reviewIdentity(\"conflicting_profile_candidates\", incoming, urlMatches);\n\n  const normalized = normalizeName(incoming.name);\n  const exactNames = normalized ? candidates.filter((candidate) => candidate.normalizedName === normalized) : [];\n  if (exactNames.length === 1) {\n    const conflicts = identityConflicts(incoming, exactNames[0]);\n    return conflicts.length ? reviewIdentity(\"identity_conflict\", incoming, exactNames) : acceptedIdentity(\"exact_name\", incoming, exactNames[0]);\n  }\n  if (exactNames.length > 1) return reviewIdentity(\"ambiguous_exact_name\", incoming, exactNames);\n\n  const partial = incoming.name ? candidates.filter((candidate) => namesArePartial(incoming.name, candidate.name)) : [];\n  if (partial.length) return reviewIdentity(\"partial_name\", incoming, partial);\n  return { status: \"unmatched\", matchBy: null, candidate: null, candidates: [], conflicts: [], identityPatch: {} };\n}\n\nfunction acceptedIdentity(matchBy, incoming, candidate) {\n  const identityPatch = {};\n  if (incoming.urn && !candidate.urn) identityPatch.linkedin_urn = incoming.urn;\n  if (incoming.profileUrl && !candidate.profileUrl) identityPatch.linkedin = canonicalLinkedInUrl(incoming.profileUrl);\n  return { status: \"matched\", matchBy, candidate, candidates: [candidate], conflicts: [], identityPatch };\n}\n\nfunction reviewIdentity(reason, incoming, candidates) {\n  return {\n    status: \"needs_review\",\n    reason,\n    matchBy: null,\n    candidate: null,\n    candidates,\n    conflicts: candidates.flatMap((candidate) => identityConflicts(incoming, candidate).map((field) => ({ candidateId: candidate.id, field }))),\n    identityPatch: {},\n  };\n}\n\nfunction boundedDeepSeekRequest(incoming, candidates) {\n  return {\n    model: \"deepseek-chat\",\n    temperature: 0,\n    response_format: { type: \"json_object\" },\n    messages: [\n      {\n        role: \"system\",\n        content: \"Rank only the supplied Attio candidates. Never approve or recommend an automatic merge. Return JSON only.\",\n      },\n      {\n        role: \"user\",\n        content: JSON.stringify({\n          incoming: {\n            name: incoming.name || \"\", urn: incoming.urn || \"\", profile_url: incoming.profileUrl || \"\",\n            occupation: incoming.occupation || \"\",\n          },\n          candidates: candidates.map((candidate) => ({\n            attio_person_id: candidate.id, name: candidate.name, urn: candidate.urn,\n            profile_url: candidate.profileUrl, company_ids: candidate.companyIds,\n          })),\n          required_schema: {\n            ranked_candidate_ids: [\"attio-person-id\"], evidence: [{ candidate_id: \"attio-person-id\", reasons: [\"string\"] }],\n            conflicts: [{ candidate_id: \"attio-person-id\", fields: [\"string\"] }], no_match_explanation: \"string\",\n          },\n        }),\n      },\n    ],\n  };\n}\n\nfunction validateDeepSeekRanking(value, allowedCandidateIds) {\n  const parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n  const allowed = new Set(allowedCandidateIds);\n  if (!parsed || !Array.isArray(parsed.ranked_candidate_ids) || !Array.isArray(parsed.evidence) || !Array.isArray(parsed.conflicts)) {\n    throw new Error(\"DeepSeek response does not match the required schema\");\n  }\n  if (parsed.ranked_candidate_ids.some((id) => !allowed.has(id))) throw new Error(\"DeepSeek returned an out-of-bounds candidate\");\n  return {\n    rankedCandidateIds: [...new Set(parsed.ranked_candidate_ids)],\n    evidence: parsed.evidence.filter((item) => allowed.has(item?.candidate_id)),\n    conflicts: parsed.conflicts.filter((item) => allowed.has(item?.candidate_id)),\n    noMatchExplanation: safeString(parsed.no_match_explanation),\n  };\n}\n\nfunction resolveCompany({ domain, name }, companies) {\n  const canonicalDomain = safeString(domain).toLocaleLowerCase(\"en\").replace(/^https?:\\/\\//, \"\").replace(/^www\\./, \"\").split(\"/\")[0];\n  const normalizedName = normalizeName(name);\n  const identities = companies.map((company) => {\n    const domains = (company?.values?.domains || []).map((value) =>\n      safeString(value.domain || value.value).toLocaleLowerCase(\"en\").replace(/^www\\./, \"\"),\n    );\n    const companyName = safeString(firstValue(company, \"name\").value);\n    return { id: company?.id?.record_id || company?.id, name: companyName, normalizedName: normalizeName(companyName), domains };\n  });\n  const domainMatches = canonicalDomain ? identities.filter((company) => company.domains.includes(canonicalDomain)) : [];\n  if (domainMatches.length === 1) return { status: \"matched\", matchBy: \"domain\", company: domainMatches[0] };\n  if (domainMatches.length > 1) return { status: \"ambiguous\", matchBy: \"domain\", candidates: domainMatches };\n  const nameMatches = normalizedName ? identities.filter((company) => company.normalizedName === normalizedName) : [];\n  if (nameMatches.length === 1) return { status: \"matched\", matchBy: \"name\", company: nameMatches[0] };\n  if (nameMatches.length > 1) return { status: \"ambiguous\", matchBy: \"name\", candidates: nameMatches };\n  return { status: \"unmatched\", matchBy: null, candidates: [] };\n}\n\nfunction eventLedgerDecision(rows, { now = new Date(), staleAfterMs = 10 * 60 * 1000 } = {}) {\n  if (!rows.length) return { process: true, reason: \"new\", attempts: 1, completedSteps: [] };\n  const ordered = [...rows].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));\n  const canonical = ordered[0];\n  if (canonical.status === \"completed\") return { process: false, reason: \"completed\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  const stale = canonical.status !== \"processing\" || now.valueOf() - new Date(canonical.updated_at || 0).valueOf() >= staleAfterMs;\n  if (!stale) return { process: false, reason: \"already_processing\", canonical, duplicateRowIds: ordered.slice(1).map((row) => row.id) };\n  let completedSteps = [];\n  try { completedSteps = JSON.parse(canonical.completed_steps || \"[]\"); } catch { completedSteps = []; }\n  return {\n    process: true,\n    reason: canonical.status === \"failed\" ? \"retry_failed\" : \"resume_stale\",\n    attempts: Number(canonical.attempts || 0) + 1,\n    completedSteps,\n    canonical,\n    duplicateRowIds: ordered.slice(1).map((row) => row.id),\n  };\n}\n\nfunction applyEventTimeGuard(state, event) {\n  const incoming = new Date(event.timestamp).valueOf();\n  const committed = state?.newest_committed_at ? new Date(state.newest_committed_at).valueOf() : Number.NEGATIVE_INFINITY;\n  return {\n    shouldAdvance: Number.isFinite(incoming) && incoming > committed,\n    newestCommittedAt: incoming > committed ? event.timestamp : state?.newest_committed_at || null,\n    direction: incoming > committed ? event.direction : state?.last_direction || null,\n  };\n}\n\nfunction mergeCase(caseRow, event) {\n  let eventKeys = [];\n  try { eventKeys = JSON.parse(caseRow?.event_keys || \"[]\"); } catch { eventKeys = []; }\n  const isNewEvent = !eventKeys.includes(event.eventKey);\n  if (isNewEvent) eventKeys.push(event.eventKey);\n  return {\n    eventKeys,\n    messageCount: Number(caseRow?.message_count || 0) + (isNewEvent ? 1 : 0),\n    latestPreview: event.text.slice(0, 500),\n  };\n}\n\nfunction dedupeAndSortMessages(messages, { cap = 10_000 } = {}) {\n  const unique = new Map();\n  for (const message of messages) {\n    const id = safeString(message.id || message.message_id);\n    if (!id || unique.has(id)) continue;\n    const text = safeString(message.text || message.message);\n    unique.set(id, { ...message, id, text: text || attachmentLabel(message) });\n  }\n  const sorted = [...unique.values()].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));\n  return { messages: sorted.slice(Math.max(0, sorted.length - cap)), truncated: sorted.length > cap, totalUnique: sorted.length };\n}\n\nfunction buildTranscript(messages, { repName, counterpartName, timeZone = \"Asia/Tbilisi\" } = {}) {\n  const format = new Intl.DateTimeFormat(\"en-CA\", {\n    timeZone, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", hourCycle: \"h23\",\n  });\n  return messages.map((message) => {\n    const parts = Object.fromEntries(format.formatToParts(new Date(message.timestamp)).map((part) => [part.type, part.value]));\n    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;\n    const sender = message.is_sender === 1 || message.isSender === true ? repName : counterpartName;\n    return `${stamp} · ${sender}: ${safeString(message.text) || attachmentLabel(message)}`;\n  }).join(\"\\n\");\n}\n\nfunction transcriptSaga({ oldNoteId, newNoteId, pointerUpdated, oldNoteDeleted }) {\n  if (!newNoteId) return { status: \"failed\", retry: \"create_replacement\", canonicalNoteId: oldNoteId || \"\" };\n  if (!pointerUpdated) return { status: \"compensate\", deleteNoteId: newNoteId, canonicalNoteId: oldNoteId || \"\" };\n  if (oldNoteId && !oldNoteDeleted) return { status: \"cleanup_pending\", deleteNoteId: oldNoteId, canonicalNoteId: newNoteId };\n  return { status: \"committed\", canonicalNoteId: newNoteId };\n}\n\nfunction buildIdentityReviewCard({ caseKey, event, ranking, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const top = ranking.rankedCandidateIds?.[0] || \"\";\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey, candidateId: top }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  return {\n    channel,\n    text: `Identity review: ${event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Possible Attio identity match*\\n${event.counterpart.name || \"Unknown\"} · ${event.counterpart.occupation || \"No headline\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Same person\" }, url: `${base}&a=same_person` },\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Different person\" }, url: `${base}&a=different_person` },\n      ] },\n    ],\n  };\n}\n\nfunction buildQualificationCard({ caseKey, event, personName, companyName, evidence, actionBaseUrl, channel = \"C0BQ53M5JKF\" }) {\n  const payload = encodeURIComponent(JSON.stringify({ caseKey, eventKey: event.eventKey }));\n  const base = `${actionBaseUrl}?p=${payload}`;\n  const details = [event.counterpart.profileUrl, event.counterpart.occupation, evidence].filter(Boolean).join(\" · \");\n  return {\n    channel,\n    text: `Qualification required: ${personName || event.counterpart.name || \"unknown\"}`,\n    blocks: [\n      { type: \"section\", text: { type: \"mrkdwn\", text: `*Qualification required*\\n${personName || event.counterpart.name || \"Unknown\"} · ${companyName || \"Company unresolved\"}` } },\n      { type: \"section\", text: { type: \"mrkdwn\", text: `>${event.text.replace(/\\n/g, \"\\n>\").slice(0, 500)}` } },\n      ...(details ? [{ type: \"context\", elements: [{ type: \"mrkdwn\", text: details.slice(0, 1500) }] }] : []),\n      { type: \"actions\", elements: [\n        { type: \"button\", style: \"danger\", text: { type: \"plain_text\", text: \"Not qualified\" }, url: `${base}&a=not_qualified` },\n        { type: \"button\", style: \"primary\", text: { type: \"plain_text\", text: \"Qualified\" }, url: `${base}&a=qualified` },\n      ] },\n    ],\n  };\n}\n\n\nconst base=$('Prepare durable case').first().json; const rows=$input.all().map(i=>i.json).filter(r=>r.case_key); const current=rows.sort((a,b)=>new Date(b.updated_at||0)-new Date(a.updated_at||0))[0]||{};\nconst merged=mergeCase(current,base.event); const isIdentity=base.reason.startsWith('identity_');\nconst ranking=base.resolution?.ranking||{rankedCandidateIds:(base.resolution?.candidates||[]).map(c=>c.id)};\nlet companyName=base.resolution?.companyName||base.companyEvidence?.name||''; if(!companyName){const match=safeString(base.event.counterpart.occupation).match(/(?:\\bat\\b|@)\\s+([^|,;]+)$/i);companyName=safeString(match?.[1]);}\nconst companyDomain=base.resolution?.companyDomains?.[0]||base.companyEvidence?.domain||''; const companyEvidence=base.event.counterpart.occupation||'';\nconst actionBaseUrl='https://velogtm.co/webhook/linkedin-create-lead';\nconst card=isIdentity?buildIdentityReviewCard({caseKey:base.caseKey,event:base.event,ranking,actionBaseUrl}):buildQualificationCard({caseKey:base.caseKey,event:base.event,personName:base.resolution?.candidate?.name||base.event.counterpart.name,companyName,evidence:companyEvidence,actionBaseUrl});\nconst payload=encodeURIComponent(JSON.stringify({caseKey:base.caseKey,eventKey:base.event.eventKey,candidateId:ranking.rankedCandidateIds?.[0]||''}));\nfor(const block of card.blocks){for(const button of block.elements||[]){if(button.url) button.url+='&k='+encodeURIComponent(base.caseKey);}}\ncard.text+=' · '+merged.messageCount+' message'+(merged.messageCount===1?'':'s');\nreturn [{json:{...base,currentCase:current,caseExists:Boolean(current.slack_ts),messageCount:merged.messageCount,eventKeys:merged.eventKeys,latestPreview:merged.latestPreview,companyName,companyDomain,companyEvidence,card}}];\n"
+      }
+    },
+    {
+      "id": "processor-slack-parent-exists",
+      "name": "Slack parent exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        1100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ $json.caseExists }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-slack-reply-under-case",
+      "name": "Slack: Reply under case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        1100
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: $json.currentCase.slack_channel, thread_ts: $json.currentCase.slack_ts, text: $json.latestPreview }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "wrKST14oJKHjskWK",
+          "name": "Slack Attio Bot (xoxb)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "processor-slack-update-parent-case",
+      "name": "Slack: Update parent case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        1320
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://slack.com/api/chat.update",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify(Object.assign({}, $('Build or update Slack case').first().json.card, { ts: $('Build or update Slack case').first().json.currentCase.slack_ts })) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "wrKST14oJKHjskWK",
+          "name": "Slack Attio Bot (xoxb)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "processor-slack-open-parent-case",
+      "name": "Slack: Open parent case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        1320
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.card) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "wrKST14oJKHjskWK",
+          "name": "Slack Attio Bot (xoxb)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "processor-prepare-case-ledger-commit",
+      "name": "Prepare case ledger commit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        1320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "\nconst b=$('Build or update Slack case').first().json; const response=$input.first().json||{}; const ts=b.currentCase.slack_ts||response.ts||'';\nreturn [{json:{...b,slackTs:ts,slackChannel:b.currentCase.slack_channel||response.channel||b.card.channel,caseOk:Boolean(ts),caseError:ts?'':'Slack case write failed'}}];\n"
+      }
+    },
+    {
+      "id": "processor-dt-save-case",
+      "name": "DT: Save case",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        780,
+        1320
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "MwDh3e70jYQpCgy3"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "case_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.caseKey }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "case_key": "={{ $json.caseKey }}",
+            "account_id": "={{ $json.event.accountId }}",
+            "chat_id": "={{ $json.event.chatId }}",
+            "reason": "={{ $json.reason }}",
+            "status": "waiting_review",
+            "person_id": "={{ $json.resolution?.candidate?.id || '' }}",
+            "candidate_ids": "={{ JSON.stringify(($json.resolution?.candidates || []).map(c => c.id)) }}",
+            "company_id": "={{ $json.resolution?.companyId || '' }}",
+            "slack_channel": "={{ $json.slackChannel }}",
+            "slack_ts": "={{ $json.slackTs }}",
+            "message_count": "={{ $json.messageCount }}",
+            "latest_preview": "={{ $json.latestPreview }}",
+            "event_keys": "={{ JSON.stringify($json.eventKeys) }}",
+            "resolution": "",
+            "updated_at": "={{ $now.toISO() }}",
+            "action_nonce": "",
+            "action_result": "",
+            "company_name": "={{ $json.companyName }}",
+            "company_domain": "={{ $json.companyDomain }}",
+            "company_evidence": "={{ $json.companyEvidence }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-dt-mark-waiting-review",
+      "name": "DT: Mark waiting review",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        1320
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "y3BvGIGRQqVrpGM7"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "event_key",
+              "condition": "eq",
+              "keyValue": "={{ $('Build or update Slack case').first().json.event.eventKey }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_key": "={{ $('Build or update Slack case').first().json.event.eventKey }}",
+            "status": "waiting_review",
+            "attempts": "={{ $('Build or update Slack case').first().json.attempts }}",
+            "completed_steps": "={{ JSON.stringify(['identity_resolved','case_opened']) }}",
+            "outputs": "={{ JSON.stringify({ caseKey: $('Build or update Slack case').first().json.caseKey, slackTs: $('Prepare case ledger commit').first().json.slackTs }) }}",
+            "last_error": "",
+            "normalized_event": "={{ JSON.stringify($('Build or update Slack case').first().json.event) }}",
+            "case_key": "={{ $('Build or update Slack case').first().json.caseKey }}",
+            "person_id": "={{ $('Build or update Slack case').first().json.resolution?.candidate?.id || '' }}",
+            "company_id": "={{ $('Build or update Slack case').first().json.resolution?.companyId || '' }}",
+            "updated_at": "={{ $now.toISO() }}",
+            "next_retry_at": "={{ $now.plus({ days: 365 }).toISO() }}",
+            "stale_after": "={{ $now.plus({ days: 365 }).toISO() }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-waiting-review-result",
+      "name": "Waiting-review result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        1320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b=$('Build or update Slack case').first().json;return [{json:{ok:true,status:'waiting_review',eventKey:b.event.eventKey,caseKey:b.caseKey,slackTs:$('Prepare case ledger commit').first().json.slackTs}}];"
+      }
+    },
+    {
+      "id": "processor-prepare-completion",
+      "name": "Prepare completion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        1540
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b=$input.first().json;const result=b.mutationResult||{};return [{json:{...b,result,completionOk:result.ok!==false}}];"
+      }
+    },
+    {
+      "id": "processor-history-truncated",
+      "name": "History truncated?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        1540
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "condition",
+              "leftValue": "={{ Boolean($json.result.historyTruncated) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-slack-alert-history-truncation",
+      "name": "Slack: Alert history truncation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        1540
+      ],
+      "parameters": {
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: 'C0BQ53M5JKF', text: 'LinkedIn history truncated at 10,000 messages', blocks: [{ type: 'section', text: { type: 'mrkdwn', text: ':warning: *LinkedIn history truncated*\nChat `' + $json.event.chatId + '` exceeded 10,000 messages. The canonical transcript is flagged as truncated, not complete.' } }] }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "wrKST14oJKHjskWK",
+          "name": "Slack Attio Bot (xoxb)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "processor-dt-mark-completed",
+      "name": "DT: Mark completed",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        780,
+        1540
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "y3BvGIGRQqVrpGM7"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "event_key",
+              "condition": "eq",
+              "keyValue": "={{ $json.event.eventKey }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "event_key": "={{ $json.event.eventKey }}",
+            "status": "completed",
+            "attempts": "={{ $json.attempts }}",
+            "completed_steps": "={{ JSON.stringify($json.result.completedSteps || ['handled']) }}",
+            "outputs": "={{ JSON.stringify($json.result || {}) }}",
+            "last_error": "",
+            "normalized_event": "={{ JSON.stringify($json.event) }}",
+            "person_id": "={{ $json.result.personId || $json.resolution?.candidate?.id || '' }}",
+            "company_id": "={{ $json.result.companyId || $json.resolution?.companyId || '' }}",
+            "updated_at": "={{ $now.toISO() }}",
+            "next_retry_at": "={{ $now.toISO() }}",
+            "stale_after": "={{ $now.toISO() }}",
+            "cleanup_note_id": "={{ $json.result.cleanupNoteId || '' }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "processor-completed-result",
+      "name": "Completed result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        1540
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b=$('Prepare completion').first().json;return [{json:{ok:true,status:'completed',eventKey:b.event.eventKey,...b.result}}];"
+      }
+    }
+  ],
+  "connections": {
+    "When called": {
+      "main": [
+        [
+          {
+            "node": "Normalize envelope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize envelope": {
+      "main": [
+        [
+          {
+            "node": "Processable event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Processable event?": {
+      "main": [
+        [
+          {
+            "node": "DT: Get event ledger",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ignored event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Get event ledger": {
+      "main": [
+        [
+          {
+            "node": "Coalesce and gate event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Coalesce and gate event": {
+      "main": [
+        [
+          {
+            "node": "Should run?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should run?": {
+      "main": [
+        [
+          {
+            "node": "DT: Mark processing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Completed or busy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Mark processing": {
+      "main": [
+        [
+          {
+            "node": "Prepare resolver call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare resolver call": {
+      "main": [
+        [
+          {
+            "node": "Call shared resolver",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call shared resolver": {
+      "main": [
+        [
+          {
+            "node": "Route resolution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route resolution": {
+      "main": [
+        [
+          {
+            "node": "Resolution route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolution route": {
+      "main": [
+        [
+          {
+            "node": "Prepare sync mutation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare sync mutation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare durable case",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Live SendPilot wait?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare sync mutation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare completion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare sync mutation": {
+      "main": [
+        [
+          {
+            "node": "Call shared mutation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call shared mutation": {
+      "main": [
+        [
+          {
+            "node": "Evaluate mutation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate mutation": {
+      "main": [
+        [
+          {
+            "node": "Mutation OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mutation OK?": {
+      "main": [
+        [
+          {
+            "node": "Open case after identity?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DT: Mark failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Mark failed": {
+      "main": [
+        [
+          {
+            "node": "Failed result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open case after identity?": {
+      "main": [
+        [
+          {
+            "node": "Prepare durable case",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sync after qualification?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync after qualification?": {
+      "main": [
+        [
+          {
+            "node": "Prepare post-qualification sync",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare completion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare post-qualification sync": {
+      "main": [
+        [
+          {
+            "node": "Call sync after qualification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call sync after qualification": {
+      "main": [
+        [
+          {
+            "node": "Evaluate post-qualification sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate post-qualification sync": {
+      "main": [
+        [
+          {
+            "node": "Post-qualification sync OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post-qualification sync OK?": {
+      "main": [
+        [
+          {
+            "node": "Prepare completion",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DT: Mark failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live SendPilot wait?": {
+      "main": [
+        [
+          {
+            "node": "Hold 15 minutes for SendPilot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare durable case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hold 15 minutes for SendPilot": {
+      "main": [
+        [
+          {
+            "node": "Resume original event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resume original event": {
+      "main": [
+        [
+          {
+            "node": "Re-run shared resolver",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-run shared resolver": {
+      "main": [
+        [
+          {
+            "node": "Route recheck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route recheck": {
+      "main": [
+        [
+          {
+            "node": "Resolved after wait?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolved after wait?": {
+      "main": [
+        [
+          {
+            "node": "Prepare sync mutation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare durable case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare durable case": {
+      "main": [
+        [
+          {
+            "node": "DT: Get case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Get case": {
+      "main": [
+        [
+          {
+            "node": "Build or update Slack case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build or update Slack case": {
+      "main": [
+        [
+          {
+            "node": "Slack parent exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack parent exists?": {
+      "main": [
+        [
+          {
+            "node": "Slack: Reply under case",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack: Open parent case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Reply under case": {
+      "main": [
+        [
+          {
+            "node": "Slack: Update parent case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Update parent case": {
+      "main": [
+        [
+          {
+            "node": "Prepare case ledger commit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Open parent case": {
+      "main": [
+        [
+          {
+            "node": "Prepare case ledger commit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare case ledger commit": {
+      "main": [
+        [
+          {
+            "node": "DT: Save case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Save case": {
+      "main": [
+        [
+          {
+            "node": "DT: Mark waiting review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Mark waiting review": {
+      "main": [
+        [
+          {
+            "node": "Waiting-review result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare completion": {
+      "main": [
+        [
+          {
+            "node": "History truncated?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "History truncated?": {
+      "main": [
+        [
+          {
+            "node": "Slack: Alert history truncation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DT: Mark completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Alert history truncation": {
+      "main": [
+        [
+          {
+            "node": "DT: Mark completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DT: Mark completed": {
+      "main": [
+        [
+          {
+            "node": "Completed result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "k33dMa0HRqqRzbK1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  }
+}
